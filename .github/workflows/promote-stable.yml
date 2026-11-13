@@ -1,0 +1,113 @@
+# Moves the GHCR :stable channel tag to the newest FINAL release that has
+# "baked" on the latest channel for at least the soak window (Claude-Code-
+# style soak model — see docs/update-channels.md). The on-tag release
+# workflow only moves :latest (immediately); :stable lags by the soak.
+#
+# Runs daily and on demand. Idempotent: re-pointing :stable to the same
+# version is a no-op cost-wise.
+name: Promote stable channel
+
+on:
+  schedule:
+    - cron: "17 6 * * *" # daily ~06:17 UTC
+  workflow_dispatch:
+    inputs:
+      soak_days:
+        description: "Soak window in days — whole number, clamped to a 7-day floor"
+        default: "7"
+
+# Default the workflow to read-only and grant the write scope on the one job
+# that needs it. This workflow has a single job, so the effect is identical —
+# but a top-level `packages: write` would be inherited by any job added later
+# without anyone having to ask for it, and that is what Scorecard's
+# Token-Permissions check flags.
+permissions:
+  contents: read
+
+concurrency:
+  group: promote-stable
+  cancel-in-progress: false
+
+jobs:
+  promote-stable:
+    name: Promote :stable to the newest soaked final
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # gh api reads the release list; no checkout in this job
+      packages: write # retag :stable in GHCR
+    steps:
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Resolve newest soaked final release
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOAK_DAYS_INPUT: ${{ github.event.inputs.soak_days || '7' }}
+        run: |
+          set -euo pipefail
+          # SOAK_DAYS_INPUT is operator-supplied on workflow_dispatch, so it
+          # must be validated before it reaches an arithmetic context.
+          # Command substitution executes inside $(( )) via array-subscript
+          # evaluation — `SOAK_DAYS=$'PATH[$(cmd)]'` runs cmd, and `set -euo
+          # pipefail` does not stop it because the command runs before the
+          # arithmetic error. Digits only, no sign, no expression.
+          if [[ ! "${SOAK_DAYS_INPUT}" =~ ^[0-9]+$ ]]; then
+            echo "::error::soak_days must be a whole number of days."
+            exit 1
+          fi
+          # Floor at 7. Lengthening the soak is a safe direction; shortening
+          # it would let one dispatch hand :stable a release that has not
+          # baked, and :stable is the channel OSS users auto-update from.
+          soak_days="${SOAK_DAYS_INPUT}"
+          if (( soak_days < 7 )); then
+            echo "::notice::soak_days=${soak_days} is below the 7-day floor; using 7."
+            soak_days=7
+          fi
+          soak_seconds=$(( soak_days * 86400 ))
+          # Newest FINAL (non-draft, non-prerelease) release whose
+          # published_at is at least the soak window in the past, by SemVer.
+          version=$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=30" --jq "
+            [ .[]
+              | select(.draft == false and .prerelease == false)
+              | select((now - (.published_at | fromdateiso8601)) >= ${soak_seconds})
+              | .tag_name | ltrimstr(\"v\")
+            ]
+            | sort_by(split(\".\") | map(tonumber? // 0))
+            | last // \"\"
+          ")
+          if [[ -z "${version}" ]]; then
+            echo "No final release has soaked >= ${soak_days}d yet — nothing to promote."
+            echo "promote=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Soaked stable target: ${version}"
+            echo "promote=true" >> "$GITHUB_OUTPUT"
+            echo "version=${version}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Promote :<version> → :stable
+        if: steps.resolve.outputs.promote == 'true'
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          images=(
+            buggy-litellm
+            buggy-langgraph
+            buggy-sandbox
+            buggy-cli
+            buggy-skillogy
+            buggy-c2-sliver
+            buggy-web
+          )
+          for img in "${images[@]}"; do
+            src="ghcr.io/purpleailab/${img}:${VERSION}"
+            dst="ghcr.io/purpleailab/${img}:stable"
+            echo "Promoting ${src} → ${dst}"
+            docker buildx imagetools create --tag "${dst}" "${src}"
+          done

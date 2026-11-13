@@ -1,0 +1,575 @@
+"""SkillogyMiddleware — Phase 1a Brain Anatomy thin wrapper around the
+skillogy service (Neo4j-backed). Replaces the file-system-backed
+SkillsMiddleware in agents wired with ``BUGGY_SKILL_BACKEND=
+skillogy_brain``.
+
+Agent tool surface (Phase 1a, three tools — see Amendment v0.2.2)
+-----------------------------------------------------------------
+- ``find_skill(query?, subdomain?, mitre_id?, tag?, tactic_id?,
+  limit=20)`` — relationship-aware discovery. AND-combined filters.
+  Returns each match's name, path, subdomain, description, plus the
+  matched MITRE IDs and tags so the agent sees *why* the skill came
+  back.
+- ``load_skill(name_or_path)`` — fetch the body of one ``:Skill`` node
+  (metadata is search-side, returned by ``find_skill``). Accepts either a unique ``name`` or the
+  canonical ``/skills/.../SKILL.md`` path.
+- ``traverse(from_path, edge_types?, depth=2)`` — explicit graph
+  walking from a Skill seed along a whitelisted edge set.
+
+``run_cypher_read`` was removed from the agent surface in v0.2.2 — its
+purpose (associative navigation) is fully covered by ``find_skill``
+AND-combining over the five edge types and ``traverse`` doing
+variable-length BFS. ``Neo4jBackend.run_cypher_read`` and its
+read-only enforcement layers are kept in the server backend for
+internal diagnostics, Phase 1b's ``recall()`` implementation, and test
+fixtures — they are simply not exposed as an agent tool.
+
+Architecture
+------------
+Phase 1a v0.2.1 service-architecture pivot, completed in Amendment
+v0.2.2: this middleware is a *thin REST client* of the standalone
+skillogy container. The agent process holds no Neo4j Bolt connection
+of its own and the langgraph image carries no ``neo4j`` driver
+dependency. ``RestSkillogyClient`` mirrors ``Neo4jBackend``'s method
+surface so unit tests can swap the implementation behind the same
+duck-typed contract.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+from typing import Any
+
+from langchain.agents.middleware import AgentMiddleware
+from langchain_core.messages import SystemMessage
+from langchain_core.tools import tool
+from typing_extensions import override
+
+log = logging.getLogger(__name__)
+
+
+class _SkillogyScopeError(RuntimeError):
+    """A role's Skillogy path allowlist could not be resolved safely."""
+
+
+def _checked_scope(prefixes: list[str], *, role: str | None) -> list[str]:
+    if not prefixes or any(
+        not isinstance(prefix, str)
+        or not prefix.startswith("/skills/")
+        or prefix == "/skills/"
+        or not prefix.endswith("/")
+        or ".." in prefix
+        for prefix in prefixes
+    ):
+        raise _SkillogyScopeError(f"Skillogy requires a nonempty restricted scope for {role!r}")
+    return prefixes
+
+
+_DEFAULT_SKILLOGY_URL = "http://skillogy:9100"
+
+# Static graph schema + 3-tool usage policy. This block is identical for
+# every agent — the per-agent phase context is rendered separately by
+# ``_render_phase_block`` and concatenated at injection time.
+_POLICY_PROMPT = """
+
+[Skillogy access]
+Skills live in a Neo4j knowledge graph (MITRE ATT&CK Enterprise v19.1).
+
+Graph schema — what the tool filters walk:
+  Nodes
+    (:Skill   {name, path, subdomain, description, when_to_use, body})
+    (:Phase   {name, kill_chain_order, kind})    e.g. 'reconnaissance', 'active-directory'
+    (:MoC     {name, parent_phase, description}) per-phase concept navigation map
+    (:Tag     {name})                            e.g. 'kerberoasting', 'credential-theft'
+    (:Tactic  {id, name})                        e.g. id='TA0001' 'Initial Access'
+    (:Technique {id, name, is_subtechnique, parent_id, platforms})
+                                                 e.g. id='T1558.003' Kerberoasting
+  Edges
+    (:Skill)-[:IN_PHASE]->(:Phase)
+    (:Skill)-[:BELONGS_TO]->(:MoC)
+    (:Skill)-[:TAGGED]->(:Tag)
+    (:Skill)-[:IMPLEMENTS]->(:Technique)
+    (:Tactic)-[:HAS_TECHNIQUE]->(:Technique)
+    (:Technique)-[:HAS_SUBTECHNIQUE]->(:Technique)
+    (:MoC)-[:BELONGS_TO_PHASE]->(:Phase)
+
+Three tools:
+  • find_skill(query?, subdomain?, mitre_id?, tag?, tactic_id?, limit=20)
+      Relationship-aware discovery. AND-combined filters:
+        subdomain → IN_PHASE        e.g. 'active-directory'
+        tag       → TAGGED          e.g. 'kerberoasting'
+        mitre_id  → IMPLEMENTS to Technique.id (T1xxx or T1xxx.yyy)
+        tactic_id → IMPLEMENTS → HAS_TECHNIQUE to Tactic.id (TAxxxx)
+        query     → substring on name / description / when_to_use
+      Returns name, path, subdomain, description, matched_mitre, matched_tags.
+  • load_skill(name_or_path)
+      Fetch one SKILL.md's body (the content only — metadata like subdomain /
+      tags / when_to_use is search-side, surfaced by find_skill). Accept a
+      unique frontmatter `name` (e.g. 'kerberoasting') or the canonical
+      '/skills/.../SKILL.md' path.
+  • traverse(from_path, edge_types?, depth=2)
+      BFS from a Skill seed along the edge whitelist
+      (IN_PHASE, IMPLEMENTS, TAGGED, BELONGS_TO, RELATED_TO,
+       HAS_TECHNIQUE, HAS_SUBTECHNIQUE). depth ≤ 5.
+
+Workflow: find_skill to narrow candidates → load_skill on the chosen
+match. Use traverse for "what is related to this skill" questions.
+assessment_contract and allowed_tools are requirements, not grants. Compare
+requirements with assessment_capabilities and actual role/source access; missing
+prerequisites stay blocked. Provenance is not execution evidence or authorization.
+"""
+
+
+# Role → :Phase.name mapping. Threaded from ``build_middleware(role=...)``
+# through ``maybe_install_skillogy(role=role)`` to the middleware so the
+# per-phase MoC summary block stays scoped to the agent's actual phase.
+# Roles not in this map run without a phase block — they still get the
+# static schema cheat-sheet and the three tools.
+_PHASE_FOR_ROLE: dict[str, str] = {
+    "recon": "reconnaissance",
+    "exploit": "web-exploitation",
+    "postexploit": "post-exploit",
+    "ad_operator": "active-directory",
+    "cloud_hunter": "cloud",
+    "mobile_operator": "mobile",
+    "wireless_operator": "wireless",
+    "phisher": "phishing",
+    "analyst": "analyst",
+    "asvs_assessor": "analyst",
+    "contract_auditor": "smart-contracts",
+    "reverser": "reverse-engineering",
+    "osint_operator": "osint",
+    "iot_operator": "iot",
+    "ics_operator": "ics-ot",
+    "forensicator": "dfir",
+    "supply_chain_operator": "supply-chain",
+    # Blue Cell is the purple-team detection-validation agent (defensive sibling
+    # of the Red Cell); adversary-emulation is the seeded meta phase for the
+    # red/blue validation bridge — there is no dedicated blue-team phase.
+    "blue_cell": "adversary-emulation",
+    "soundwave": "planning",
+    "buggy": "orchestration",
+    # Bounty bundle (fork-only) — phase-scope each appsec / bug-bounty
+    # specialist so it gets the per-phase MoC summary under Skillogy.
+    # Phases below are all seeded ``:Phase`` nodes and match each role's
+    # skill subdomain. ``scout`` is the intake / program-selection agent.
+    "scout": "planning",
+    "asvs": "web-exploitation",
+    "api_security": "web-exploitation",
+    "authn_session": "web-exploitation",
+    "business_logic": "web-exploitation",
+    "graphql_security": "web-exploitation",
+    "ssrf_cloud": "web-exploitation",
+    "clientside_security": "web-exploitation",
+    "mitre_attack": "adversary-emulation",
+    "llm_security": "ai-security",
+    "secrets_cicd": "supply-chain",
+}
+
+
+def _resolve_skillogy_url() -> str:
+    return os.environ.get("BUGGY_SKILLOGY_URL", _DEFAULT_SKILLOGY_URL)
+
+
+def _resolve_skillogy_api_key() -> str | None:
+    return os.environ.get("BUGGY_SKILLOGY_API_KEY") or None
+
+
+_USE_SKILLOGY_FALSY: frozenset[str] = frozenset({"0", "false", "no", "off"})
+
+
+def _is_enabled() -> bool:
+    # Skillogy is the canonical skill-retrieval backend; the in-process
+    # FilesystemBackend stays available as an explicit opt-out for
+    # standalone library use and pytest. Treat an unset / blank
+    # ``BUGGY_USE_SKILLOGY`` as enabled; honor an explicit falsy
+    # value as a disable. Backward compat: the legacy
+    # ``BUGGY_SKILL_BACKEND=skillogy_brain`` rail still flips it on
+    # even when ``BUGGY_USE_SKILLOGY=0`` (explicit user request via
+    # the new env name wins).
+    if os.environ.get("BUGGY_SKILL_BACKEND", "").strip().lower() == "skillogy_brain":
+        return True
+    raw = os.environ.get("BUGGY_USE_SKILLOGY", "").strip().lower()
+    return raw not in _USE_SKILLOGY_FALSY
+
+
+def _backend_factory():
+    """Build the default REST client used when the middleware is
+    activated without an explicit ``backend=`` injection.
+
+    Phase 1a v0.2.1 service-architecture pivot: the agent process talks
+    to the standalone skillogy container over REST and does not import
+    the neo4j driver. The client mirrors the ``Neo4jBackend`` surface
+    so unit tests can swap in either implementation behind the same
+    duck-typed contract.
+    """
+    from buggy.skillogy.client.rest import RestSkillogyClient  # noqa: PLC0415
+
+    return RestSkillogyClient(
+        base_url=_resolve_skillogy_url(),
+        api_key=_resolve_skillogy_api_key(),
+    )
+
+
+def _make_load_skill_tool(backend, allowed_path_prefixes: list[str] | None = None):
+    # Per ADR-0008 — when the closure has no allowlist (library / pytest
+    # path), omit the kwarg entirely so legacy fakes that don't accept
+    # ``**kwargs`` still work. When the allowlist is populated we forward
+    # it and rely on the backend (Neo4jBackend, RestSkillogyClient, or a
+    # role-aware fake) to honor it.
+    _acl_kwargs: dict[str, Any] = (
+        {"allowed_path_prefixes": allowed_path_prefixes} if allowed_path_prefixes else {}
+    )
+
+    @tool
+    def load_skill(name_or_path: str) -> str:
+        """Fetch one SKILL.md's body from the skillogy graph.
+
+        Accepts either a unique frontmatter ``name`` (e.g. 'kerberoasting')
+        or the canonical ``/skills/.../SKILL.md`` path. Returns the skill
+        BODY with a minimal name/path header — the other node properties
+        (subdomain, when_to_use, tags, MITRE/aatmf, allowed_tools …) exist to
+        FIND the skill via ``find_skill``; once it is loaded the agent only
+        needs the content, so they are omitted to keep the reading context
+        lean. Mirrors the filesystem ``load_skill`` (which strips frontmatter
+        and returns the body) so both backends read identically.
+        """
+        try:
+            if name_or_path.startswith("/skills/"):
+                props = backend.load_skill(name_or_path, **_acl_kwargs)
+            else:
+                # Resolve by name via a single-shot find. This keeps
+                # load_skill's signature agent-friendly; the agent does
+                # not need to remember paths.
+                hits = backend.find_skill(query=name_or_path, limit=10, **_acl_kwargs)
+                exact = [h for h in hits if h.get("name") == name_or_path]
+                if not exact:
+                    return json.dumps(
+                        {"error": f"no Skill with name or path matching {name_or_path!r}"}
+                    )
+                props = backend.load_skill(exact[0]["path"], **_acl_kwargs)
+            if props is None:
+                return json.dumps({"error": f"no Skill at path {name_or_path!r}"})
+            # Body only (+ minimal header). Metadata props are search-side
+            # (find_skill); dumping them into the agent's context on every load
+            # is noise. Header mirrors the filesystem load_skill's format.
+            body = str(props.get("body") or "")
+            path = str(props.get("path") or name_or_path)
+            base_dir = path.rsplit("/", 1)[0] if "/" in path else "/"
+            name = str(props.get("name") or "")
+            description = str(props.get("description") or "").strip()
+            header = f"Base directory for this skill: {base_dir}\nSkill: {name}" + (
+                f" — {description}" if description else ""
+            )
+            return f"{header}\n\n{body.rstrip()}\n"
+        except Exception as exc:  # noqa: BLE001 — surface as ToolMessage payload
+            return json.dumps({"error": f"load_skill failed: {exc!r}"})
+
+    return load_skill
+
+
+def _make_find_skill_tool(backend, allowed_path_prefixes: list[str] | None = None):
+    _acl_kwargs: dict[str, Any] = (
+        {"allowed_path_prefixes": allowed_path_prefixes} if allowed_path_prefixes else {}
+    )
+
+    @tool
+    def find_skill(
+        query: str | None = None,
+        subdomain: str | None = None,
+        mitre_id: str | None = None,
+        tag: str | None = None,
+        tactic_id: str | None = None,
+        limit: int = 20,
+    ) -> str:
+        """Relationship-aware skill discovery in the skillogy graph.
+
+        Filters AND-combine. Pass at least one. ``query`` substring-matches
+        name/description/triggers. ``subdomain`` follows IN_PHASE.
+        ``mitre_id`` follows IMPLEMENTS to a Technique. ``tag`` follows
+        TAGGED. ``tactic_id`` (e.g. 'TA0001' for Initial Access) ladders
+        via IMPLEMENTS → HAS_TECHNIQUE. Returns each hit's name, path,
+        subdomain, description, matched_mitre, matched_tags.
+        """
+        try:
+            hits = backend.find_skill(
+                query=query,
+                subdomain=subdomain,
+                mitre_id=mitre_id,
+                tag=tag,
+                tactic_id=tactic_id,
+                limit=limit,
+                **_acl_kwargs,
+            )
+            return json.dumps({"count": len(hits), "hits": hits}, ensure_ascii=False, default=str)
+        except ValueError as exc:
+            return json.dumps({"error": str(exc)})
+        except Exception as exc:  # noqa: BLE001
+            return json.dumps({"error": f"find_skill failed: {exc!r}"})
+
+    return find_skill
+
+
+def _make_traverse_tool(backend, allowed_path_prefixes: list[str] | None = None):
+    _acl_kwargs: dict[str, Any] = (
+        {"allowed_path_prefixes": allowed_path_prefixes} if allowed_path_prefixes else {}
+    )
+
+    @tool
+    def traverse(
+        from_path: str,
+        edge_types: list[str] | None = None,
+        depth: int = 2,
+    ) -> str:
+        """Variable-length BFS from a Skill seed along the relationship whitelist.
+
+        ``from_path`` is the canonical /skills/.../SKILL.md path of the
+        starting Skill. ``edge_types`` defaults to the spec-§5.7.2
+        whitelist (IN_PHASE, IMPLEMENTS, TAGGED, BELONGS_TO, RELATED_TO,
+        HAS_TECHNIQUE, HAS_SUBTECHNIQUE). ``depth`` ≤ 5. Returns each
+        neighbour's label, key, depth, and the edge-type chain that
+        connected it.
+        """
+        try:
+            rows = backend.traverse(
+                from_path,
+                edge_types=edge_types,
+                depth=depth,
+                **_acl_kwargs,
+            )
+            return json.dumps({"count": len(rows), "rows": rows}, ensure_ascii=False, default=str)
+        except Exception as exc:  # noqa: BLE001
+            return json.dumps({"error": f"traverse failed: {exc!r}"})
+
+    return traverse
+
+
+class SkillogyMiddleware(AgentMiddleware):
+    """Wire the agent to the skillogy knowledge graph (Neo4j).
+
+    Activation: **on by default.** Skillogy is the canonical
+    skill-retrieval backend; the in-process ``FilesystemBackend`` stays
+    available as an explicit opt-out for standalone library use and
+    pytest via ``BUGGY_USE_SKILLOGY=0`` (or ``false`` / ``no`` /
+    ``off``). The legacy ``BUGGY_SKILL_BACKEND=skillogy_brain`` rail
+    still flips it on even when ``BUGGY_USE_SKILLOGY=0`` (explicit
+    user request via the new env name wins). The agent factory's
+    ``maybe_install_skillogy`` swaps ``SkillsMiddleware`` for this class
+    and threads the agent's role through so the per-phase MoC summary
+    fires for the correct phase.
+
+    The injected system-prompt block has two parts:
+
+    * **Static schema + 3-tool policy** (``_POLICY_PROMPT``) — graph
+      schema cheat-sheet so the agent understands what the
+      ``find_skill`` filters and the ``traverse`` whitelist actually
+      walk, plus the three-tool usage policy.
+    * **Dynamic phase context** (``_render_phase_block``) — built once
+      at ``__init__`` from a single ``query_moc_summary(phase)`` round
+      trip. The graph doesn't change at runtime, so we cache the
+      rendered block on the instance rather than re-querying every
+      request.
+    """
+
+    def __init__(
+        self,
+        *,
+        agent_phase: str | None = None,
+        backend: Any = None,
+        append_policy_to_system: bool = True,
+        allowed_path_prefixes: list[str] | None = None,
+    ) -> None:
+        super().__init__()
+        self._backend = backend or _backend_factory()
+        self._phase = agent_phase
+        self._append_policy = append_policy_to_system
+        # ADR-0008 — per-role path-prefix ACL. Carries the legacy
+        # ``FilesystemBackend`` contract (``skills_sources_for(role)``)
+        # forward so the two skill backends are interchangeable from an
+        # authorization standpoint. ``None`` keeps the library /
+        # standalone-CLI path unrestricted, which is how the underlying
+        # backend interprets the kwarg as well.
+        self._allowed_path_prefixes = (
+            _checked_scope(list(allowed_path_prefixes), role=None)
+            if allowed_path_prefixes is not None
+            else None
+        )
+        self.tools = [
+            _make_find_skill_tool(self._backend, self._allowed_path_prefixes),
+            _make_load_skill_tool(self._backend, self._allowed_path_prefixes),
+            _make_traverse_tool(self._backend, self._allowed_path_prefixes),
+        ]
+        # Render the phase block once at boot. Failures are non-fatal —
+        # the agent keeps the schema cheat-sheet and the three tools.
+        self._phase_block: str = self._render_phase_block() if self._phase else ""
+
+    @classmethod
+    def from_env(
+        cls,
+        *,
+        agent_phase: str | None = None,
+        allowed_path_prefixes: list[str] | None = None,
+    ) -> SkillogyMiddleware:
+        return cls(
+            agent_phase=agent_phase,
+            allowed_path_prefixes=allowed_path_prefixes,
+        )
+
+    def _render_phase_block(self) -> str:
+        """Build the dynamic ``[Phase context]`` block for this agent's phase.
+
+        Returns an empty string when the backend lookup fails or the
+        phase has no MoCs registered yet (no point injecting a header
+        with no concept areas under it).
+        """
+        if not self._phase:
+            return ""
+        try:
+            mocs = self._backend.query_moc_summary(self._phase)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "skillogy MoC summary query failed for phase %r: %s",
+                self._phase,
+                exc,
+            )
+            return ""
+        if not mocs:
+            # Phase exists in the graph but has no MoCs yet — emit a
+            # one-liner so the agent knows the phase name to filter by,
+            # without a misleading empty bullet list.
+            return (
+                f"\n\n[Phase context]\n"
+                f"You are operating in phase: {self._phase}\n"
+                f"(no MoCs registered for this phase yet — "
+                f'use find_skill(subdomain="{self._phase}") to explore.)\n'
+            )
+        lines = [
+            "",
+            "",
+            "[Phase context]",
+            f"You are operating in phase: {self._phase}",
+            "",
+            "Concept areas (MoCs) in this phase — start with these:",
+        ]
+        for m in mocs:
+            name = m.get("name", "?")
+            desc = (m.get("description") or "").strip()
+            if desc:
+                lines.append(f"  • {name} — {desc}")
+            else:
+                lines.append(f"  • {name}")
+        lines.append("")
+        lines.append(
+            f'To enter a concept area: find_skill(subdomain="{self._phase}", tag="<moc>") '
+            f"or traverse() from any matching Skill."
+        )
+        lines.append("")
+        return "\n".join(lines)
+
+    @override
+    def wrap_model_call(self, request, handler):
+        return handler(self._inject(request))
+
+    @override
+    async def awrap_model_call(self, request, handler):
+        return await handler(self._inject(request))
+
+    def _inject(self, request):
+        if not self._append_policy:
+            return request
+        injected_text = _POLICY_PROMPT + self._phase_block
+        if request.system_message is not None:
+            new_content = [
+                *request.system_message.content_blocks,
+                {"type": "text", "text": injected_text},
+            ]
+        else:
+            new_content = [{"type": "text", "text": injected_text}]
+        new_system = SystemMessage(content=new_content)
+        return request.override(system_message=new_system)
+
+
+def maybe_install_skillogy(
+    middleware_stack: list[Any],
+    *,
+    role: str | None = None,
+    skill_sources: list[str] | None = None,
+) -> list[Any]:
+    """Substitute ``SkillogyMiddleware`` for ``SkillsMiddleware`` when the
+    backend flag is set. Idempotent; swap-only (does not append).
+
+    Args:
+        middleware_stack: ordered middleware list from ``build_middleware``.
+        role: agent role (e.g. ``"recon"``) — resolved to its
+            ``:Phase.name`` via ``_PHASE_FOR_ROLE`` and threaded into the
+            new ``SkillogyMiddleware`` so its MoC summary block is scoped
+            to the agent's phase. ``None`` (or an unknown role) yields a
+            middleware with no phase block — the agent still gets the
+            schema cheat-sheet and the three tools.
+        skill_sources: per-role path-prefix allowlist (ADR-0008). Same
+            list ``_make_skills`` threads into the legacy
+            ``SkillsMiddleware``: e.g.
+            ``["/skills/standard/recon/", "/skills/shared/"]``. When
+            ``None`` is passed but a ``role`` is known, the helper falls
+            back to ``skills_sources_for(role)`` so the two skill
+            backends share one source-of-truth for "what does this role
+            see". When neither is supplied (library use, pytest), the
+            ACL stays unrestricted to match the unwrapped backend.
+    """
+    if not _is_enabled():
+        return middleware_stack
+    try:
+        from buggy.middleware.skills import SkillsMiddleware  # noqa: PLC0415
+    except ImportError:
+        return middleware_stack
+    if not any(isinstance(mw, SkillsMiddleware) for mw in middleware_stack):
+        return middleware_stack
+    phase = _PHASE_FOR_ROLE.get(role) if role else None
+    prefixes = _resolve_allowed_path_prefixes(role=role, skill_sources=skill_sources)
+    out: list[Any] = []
+    for mw in middleware_stack:
+        if isinstance(mw, SkillsMiddleware):
+            out.append(
+                SkillogyMiddleware.from_env(
+                    agent_phase=phase,
+                    allowed_path_prefixes=prefixes,
+                )
+            )
+        else:
+            out.append(mw)
+    return out
+
+
+def _resolve_allowed_path_prefixes(
+    *,
+    role: str | None,
+    skill_sources: list[str] | None,
+) -> list[str] | None:
+    """Resolve the path-prefix ACL the middleware should enforce.
+
+    Priority order, mirroring how the legacy ``SkillsMiddleware``
+    ``sources`` argument is handled:
+
+    1. Explicit ``skill_sources`` from the caller wins (lets benchmark
+       mode and plugin extensions inject extra paths).
+    2. ``role`` falls back to ``skills_sources_for(role)`` so the two
+       skill backends share one role → sources contract.
+    3. Otherwise ``None`` — the ACL stays disabled, matching how the
+       backend interprets the kwarg when no role context exists.
+    """
+    if skill_sources is not None:
+        return _checked_scope(list(skill_sources), role=role)
+    if role is None:
+        return None
+    try:
+        from buggy.agents.middleware_slots import skills_sources_for  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001
+        raise _SkillogyScopeError(f"Skillogy scope resolver unavailable for {role!r}") from exc
+    try:
+        return _checked_scope(list(skills_sources_for(role)), role=role)
+    except _SkillogyScopeError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise _SkillogyScopeError(f"Skillogy scope resolution failed for {role!r}") from exc

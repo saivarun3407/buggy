@@ -1,0 +1,818 @@
+# Shared log-rotation policy. Docker's default json-file driver ships NO
+# rotation, so container logs grow unbounded until the host disk fills and
+# the whole stack crashes. Cap every long-running service at 3×10MB.
+# Compose has no top-level logging default, so this anchor is applied
+# per-service via ``logging: *default-logging`` below.
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  # LiteLLM Proxy — LLM API Gateway
+  # Handles model routing, authentication, usage tracking, billing
+  litellm:
+    image: buggy-litellm:${BUGGY_VERSION:-stable}
+    build:
+      context: .
+      dockerfile: containers/litellm.Dockerfile
+    # #216: parameterize via BUGGY_STACK_NAME. Unset → ``buggy-litellm``
+    # (today's name verbatim). ``BUGGY_STACK_NAME=stack2`` →
+    # ``buggy-stack2-litellm``. The ``${VAR:+-${VAR}}`` form emits the
+    # dash prefix only when the variable is set so the default stays stable.
+    # Using a Buggy-scoped var instead of COMPOSE_PROJECT_NAME because
+    # Compose auto-populates COMPOSE_PROJECT_NAME from the project directory
+    # (``Buggy`` → ``buggy``), which would produce
+    # ``buggy-buggy-litellm`` on every default run.
+    container_name: buggy${BUGGY_STACK_NAME:+-${BUGGY_STACK_NAME}}-litellm
+    volumes:
+      - ./config/litellm.yaml:/app/config.yaml:ro
+      # Overlay the host handler. The image bakes an older copy, and Sonnet
+      # 5.5 / Opus 5.5 reject forced tool_choice unless this file is live.
+      - ./config/claude_code_handler.py:/app/claude_code_handler.py:ro
+      - ${CLAUDE_CREDENTIALS_VOLUME:-/dev/null}:/root/.claude/.credentials.json
+      - ${CODEX_AUTH_VOLUME:-/dev/null}:/root/.codex/auth.json
+    entrypoint: ["python", "/app/litellm_startup.py"]
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    ports:
+      - "127.0.0.1:${LITELLM_PORT:-4000}:4000"
+    env_file: .env
+    environment:
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-buggy-master}
+      - LITELLM_SALT_KEY=${LITELLM_SALT_KEY:-sk-buggy-salt-change-me}
+      - CODEX_AUTH_PATH=/root/.codex/auth.json
+      - DATABASE_URL=postgresql://buggy:${POSTGRES_PASSWORD:-buggy}@postgres:5432/litellm
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Cold-start cost (prisma migrate + model-routing load + uvicorn bind):
+    # measured 136s on a fresh PostgreSQL volume; varies with disk speed.
+    # start_period absorbs environment variability — failures during this
+    # window don't count toward retries. test success at any moment flips
+    # healthy immediately, so the cushion costs no time on fast hosts.
+    # retries is the post-cushion grace for transient failures only;
+    # the launcher's --wait-timeout (BUGGY_STARTUP_TIMEOUT_SECONDS)
+    # is the single user-facing patience knob.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4000/health/readiness')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 300s
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - buggy-net
+    restart: unless-stopped
+    logging: *default-logging
+
+  # PostgreSQL — Persistent storage for LiteLLM
+  # Stores: virtual keys, spend logs, user budgets, rate limits
+  postgres:
+    image: postgres:17-alpine
+    container_name: buggy${BUGGY_STACK_NAME:+-${BUGGY_STACK_NAME}}-postgres
+    # Working set is tiny (LiteLLM spend logs + web state, shared_buffers=32MB).
+    # Cap so a runaway query can't starve the host; 2g leaves ample headroom.
+    mem_limit: 2g
+    environment:
+      POSTGRES_DB: litellm
+      POSTGRES_USER: buggy
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-buggy}
+      # Keep shared_buffers small — Buggy stores only LiteLLM spend
+      # logs and web dashboard state; the working set fits in 32MB.
+      # Default (128MB) wastes RAM in this context. work_mem is lowered
+      # from the 4MB default because queries are simple key-value lookups.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=32MB"
+      - "-c"
+      - "work_mem=2MB"
+      - "-c"
+      - "effective_cache_size=128MB"
+      - "-c"
+      - "maintenance_work_mem=32MB"
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Auto-create buggy_web DB on first startup (empty volume only).
+      # Existing deployments: run the SQL manually or `docker volume rm postgres_data`.
+      - ./containers/postgres-init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    networks:
+      - buggy-net
+    restart: unless-stopped
+    logging: *default-logging
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U buggy -d litellm"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Neo4j — Attack Chain Graph (the agent's persistent working memory)
+  # On sandbox-net so cypher-shell from inside sandbox reaches bolt://neo4j:7687
+  neo4j:
+    # Pin the patch release: the mutable 5.26 tag currently resolves to
+    # 5.26.29, whose JVM exits with SIGBUS during startup on WSL2.
+    image: neo4j:5.26.28-community
+    container_name: buggy${BUGGY_STACK_NAME:+-${BUGGY_STACK_NAME}}-neo4j
+    # heap_max 256m + pagecache 64m + JVM/APOC off-heap ≈ <1g nominal.
+    # 2g caps the JVM so a large attack-graph scan can't swap-thrash the host.
+    mem_limit: 2g
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-buggy-graph}
+      NEO4J_server_memory_heap_initial__size: 64m
+      NEO4J_server_memory_heap_max__size: 256m
+      NEO4J_server_memory_pagecache_size: 64m
+
+      NEO4J_PLUGINS: '["apoc"]'
+      # ──────────────────────────────────────────────────────────────────
+      # APOC hardening - see docs/security/neo4j-hardening.md.
+      #
+      # PRIOR CONFIG (REMOVED, do NOT re-add):
+      #   NEO4J_dbms_security_procedures_unrestricted: apoc.*
+      #   NEO4J_apoc_export_file_enabled: "true"
+      #   NEO4J_apoc_import_file_enabled: "true"
+      #
+      # Neo4j is dual-homed across sandbox-net AND buggy-net to let
+      # the orchestrator on management read findings written from inside
+      # the sandbox. Allowing arbitrary APOC procedures - especially the
+      # file-I/O family - turns that bridge into a sandbox→management
+      # pivot path: a prompt-injection-driven Cypher payload can issue
+      #   CALL apoc.cypher.runFile('file:///proc/self/environ')
+      # or
+      #   CALL apoc.export.csv.query(..., 'file:///root/.config/...')
+      # and exfiltrate management-plane secrets.
+      #
+      # The new posture is allowlist-only. File-I/O, cross-database, and
+      # trigger procedures are unreachable from Cypher. Safe query
+      # builders (collection / text / path / merge / refactor / periodic)
+      # remain available for the kg_add_node / kg_add_edge tool surface.
+      NEO4J_dbms_security_procedures_allowlist: >-
+        apoc.coll.*,apoc.text.*,apoc.path.*,apoc.create.*,
+        apoc.merge.*,apoc.refactor.*,apoc.periodic.iterate,
+        apoc.lock.*,apoc.case,apoc.do.case,apoc.do.when,apoc.when,
+        apoc.help,apoc.version,apoc.diff.*,apoc.label.*,
+        apoc.node.*,apoc.nodes.*,apoc.rel.*,apoc.util.*
+      # Strict config validation - refuse to boot on unknown / misspelled
+      # config keys so accidental re-introduction of `_unrestricted`
+      # under a typo (e.g. `unrestricted`) cannot silently re-open the
+      # sandbox→management bridge.
+      NEO4J_server_config_strict__validation_enabled: "true"
+      # Lock HTTP API access to localhost (the orchestrator talks to
+      # Neo4j over Bolt, not HTTP). The web dashboard's Neo4j browser
+      # binding lives on 127.0.0.1 below; this disables the HTTP API for
+      # any other origin.
+      NEO4J_server_http_listen__address: "0.0.0.0:7474"
+      NEO4J_dbms_security_http__access__control__allow__origin: ""
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    ports:
+      - "127.0.0.1:${NEO4J_HTTP_PORT:-7474}:7474"
+      - "127.0.0.1:${NEO4J_BOLT_PORT:-7687}:7687"
+    networks:
+      - sandbox-net
+      - buggy-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:7474 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 90s
+    restart: unless-stopped
+    logging: *default-logging
+
+
+  # Evasive Red Team Sandbox
+  # Isolated container for executing red-team tools (nmap, whois, etc.)
+  # Runs on sandbox-net only — NO access to infra (litellm, postgres).
+  # LangGraph reaches sandbox over HTTP at http://sandbox:9999 (FastAPI
+  # daemon baked into the image). The previous ``docker exec`` transport
+  # via ``/var/run/docker.sock`` was removed in the HTTP-only migration —
+  # see buggy/backends/factory.py for the rationale.
+  sandbox:
+    image: buggy-sandbox:${BUGGY_VERSION:-stable}
+    # Multi-arch image — linux/amd64 + linux/arm64. Apple Silicon and
+    # Linux arm64 hosts pull the native manifest; no Rosetta needed.
+    # On an unusual arch the manifest list won't match — force a
+    # fallback by adding `platform: linux/amd64` to this service.
+    build:
+      context: .
+      dockerfile: containers/sandbox.Dockerfile
+    container_name: buggy${BUGGY_STACK_NAME:+-${BUGGY_STACK_NAME}}-sandbox
+    networks:
+      - sandbox-net
+    # ──────────────────────────────────────────────────────────────────
+    # Sandbox hardening - see docs/security/sandbox-isolation.md.
+    #
+    # The Kali sandbox runs root inside the container because raw sockets
+    # (nmap SYN scans, packet capture) require root and the container
+    # boundary IS the security boundary, not the user boundary. To keep
+    # that boundary tight:
+    #
+    #   - cap_drop ALL, then re-add the minimum set the offensive
+    #     toolset actually needs (NET_RAW for SYN scans, NET_ADMIN for
+    #     raw routing, NET_BIND_SERVICE for low ports, SYS_PTRACE for
+    #     frida/gdb in the Reverser path, SETUID/SETGID for tools like
+    #     msfconsole that drop privileges internally).
+    #   - no-new-privileges blocks setuid escalation within the
+    #     container even if a tool ships with a setuid binary.
+    #   - TUN-based pivots (ligolo-ng's Layer-3 tunnel) need the host
+    #     /dev/net/tun device. It is NOT mapped here: an unconditional
+    #     device mapping breaks `compose up` on any host without the tun
+    #     module, making TUN a prerequisite for every sandbox user. It is
+    #     opt-in via the docker-compose.tun.yml overlay instead.
+    #   - mem_limit caps a runaway scan / fuzzer at 4G so it can't
+    #     starve the management plane.
+    #   - pids_limit was already 1024; kept.
+    #   - read_only: NOT set. The Kali toolset writes to /tmp, /var,
+    #     /root, /workspace. A read_only root with tmpfs everywhere
+    #     would break ~30 tools. Per-engagement container isolation
+    #     (sandbox-isolation.md) is the right structural fix.
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+      - NET_BIND_SERVICE
+      - SYS_PTRACE
+      - SETUID
+      - SETGID
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - KILL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 4g
+    environment:
+      # SANDBOX_DAEMON=1 makes containers/sandbox-entrypoint.sh run the
+      # FastAPI daemon on port 9999 instead of the legacy
+      # ``tail -f /dev/null`` keep-alive. The entrypoint default is 1
+      # since the HTTP-only migration; this stanza pins it explicitly so
+      # ``docker compose config`` shows intent.
+      - SANDBOX_DAEMON=1
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:-buggy-graph}
+      - GHIDRA_INSTALL_DIR=/opt/ghidra
+      - GHIDRA_MCP_URL=http://ghidra-mcp:8089
+      # Engagement-scoped cloud credentials (e.g. an engagement AWS account
+      # for authorized claim PoCs) pass through ONLY these vars — never the
+      # whole env_file, which carries LLM/provider keys the sandbox doesn't
+      # need. Set them in .env; empty defaults keep them absent when unset.
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN:-}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-east-1}
+    volumes:
+      # Bind is engagement-scoped. The launcher sets BUGGY_ENGAGEMENT_WORKSPACE
+      # to <home>/workspace/<slug> after the engagement picker, so the agent only
+      # ever sees its own engagement at /workspace. When the launcher is not in
+      # play (raw `make dev`, benchmark harness, dev workflows), the fallback is
+      # the whole tree under <home>/workspace.
+      - ${BUGGY_ENGAGEMENT_WORKSPACE:-${BUGGY_HOME:-~/.buggy}/workspace}:/workspace
+      # Skills are no longer baked into this image — they live at
+      # ``/app/skills/`` in the LANGGRAPH container (see
+      # ``containers/langgraph.Dockerfile``) and are read in-process by
+      # ``FilesystemBackend`` via ``CompositeBackend``. The sandbox only
+      # owns ``/workspace/`` from here on.
+    pids_limit: 4096
+    # Run an init process (tini) as PID 1 inside the container. The
+    # daemon spawns tmux servers and bash shells; when a tmux server
+    # exits, its bash grandchildren are reparented to PID 1. tini reaps
+    # those orphans, preventing the <defunct> zombie accumulation that
+    # eventually exhausts the PID table (fork() -> EAGAIN). This replaces
+    # an in-process SIGCHLD reaper that raced with the daemon's own
+    # ``subprocess.run`` calls and clobbered command exit codes to 0.
+    init: true
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    restart: unless-stopped
+    logging: *default-logging
+
+
+  # Ghidra MCP — optional 245-tool reverse engineering bridge for the
+  # Reverser agent. Only built and started when the `reversing` profile is
+  # active. The headless backend in buggy/tools/reversing/ghidra.py
+  # works inside the sandbox container without this sidecar; the sidecar
+  # adds richer real-time queries (xrefs, batch decompile, P-code) via the
+  # bethington/ghidra-mcp plugin.
+  #
+  # Building this service builds the sandbox image with INSTALL_REVERSING=
+  # true (adds JDK 21 + Ghidra 12.1 + radare2 + binwalk, ~500 MB) so it
+  # has the analyzeHeadless binary needed below.
+  #
+  # NOTE: the bethington/ghidra-mcp plugin install is intentionally NOT
+  # baked into sandbox.Dockerfile yet — the plugin's release-artifact
+  # layout is not stable across Ghidra versions and the integration needs
+  # a follow-up PR to pin both sides together. Until then, this service
+  # boots Ghidra in headless mode but the MCP HTTP listener will not bind;
+  # ghidra_available() will report mcp=false and the tools will fall back
+  # to the headless-only path. Tracked separately from #279.
+  ghidra-mcp:
+    build:
+      context: .
+      dockerfile: containers/sandbox.Dockerfile
+      args:
+        INSTALL_REVERSING: "true"
+        # SHA-256 pin for the Ghidra 12.1 / 20260513 release. Set this on
+        # the build-arg side rather than baking it into the Dockerfile so
+        # an upgrade is a single-line change here. To verify, see
+        # https://github.com/NationalSecurityAgency/ghidra/releases.
+        GHIDRA_SHA256: ""
+    image: buggy-sandbox-reversing:${BUGGY_VERSION:-stable}
+    container_name: buggy${BUGGY_STACK_NAME:+-${BUGGY_STACK_NAME}}-ghidra-mcp
+    # Keep the container alive with a long-running analyzeHeadless that
+    # imports a placeholder binary. The MCP plugin (when installed) auto-
+    # starts its HTTP listener on import.
+    entrypoint:
+      - /opt/ghidra/support/analyzeHeadless
+      - /tmp/ghidra_project
+      - dcp
+      - -import
+      - /bin/true
+      - -deleteProject
+      - -noanalysis
+    environment:
+      - GHIDRA_MCP_PORT=8089
+      - JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+    networks:
+      - sandbox-net
+    mem_limit: 4g
+    cpus: 2.0
+    restart: unless-stopped
+    logging: *default-logging
+    profiles:
+      - reversing
+
+  # LangGraph Platform — Agent API Server
+  # Exposes all agents (buggy, soundwave, recon, exploit, postexploit)
+  # as a streaming API on port 2024. Ink CLI connects here.
+  langgraph:
+    image: buggy-langgraph:${BUGGY_VERSION:-stable}
+    # Append --allow-blocking by default so blockbuster doesn't fatally
+    # abort runs on sync I/O in third-party deps (e.g. deepagents'
+    # subagents.py uses a sync httpx send in its atask path). Buggy's
+    # own sync calls have been structurally fixed (see #325), but the
+    # third-party calls remain. Set LANGGRAPH_STRICT_ASYNC=1 in .env to
+    # opt out and reinstate the fatal-on-sync behavior (useful for
+    # debugging async issues in your own code).
+    # Note: $$ escapes compose interpolation so the literal $LANGGRAPH_STRICT_ASYNC
+    # reaches the shell — the env var is set on the container via env_file:.env,
+    # and the if/else decision happens at container start, not at compose render.
+    command:
+      - sh
+      - -c
+      - >
+        if [ -z "$${LANGGRAPH_STRICT_ASYNC:-}" ]; then
+          exec langgraph dev --host 0.0.0.0 --port 2024 --no-browser --n-jobs-per-worker 10 --allow-blocking;
+        else
+          exec langgraph dev --host 0.0.0.0 --port 2024 --no-browser --n-jobs-per-worker 10;
+        fi
+    build:
+      context: .
+      dockerfile: containers/langgraph.Dockerfile
+      args:
+        # Stamps pyproject.toml's version field at build time. Independent
+        # of the image tag selector above — VERSION can be unset locally
+        # (defaults to 0.0.0 sentinel) while the tag is still ":dev".
+        VERSION: ${VERSION:-0.0.0}
+    container_name: buggy${BUGGY_STACK_NAME:+-${BUGGY_STACK_NAME}}-langgraph
+    ports:
+      - "127.0.0.1:${LANGGRAPH_PORT:-2024}:2024"
+    env_file: .env
+    environment:
+      - BUGGY_LLM__PROXY_URL=http://litellm:4000
+      - BUGGY_LLM__PROXY_API_KEY=${LITELLM_MASTER_KEY:-sk-buggy-master}
+      # HTTPSandbox transport target. ``sandbox`` is the compose service
+      # name (resolves via the shared ``sandbox-net`` network below). Port
+      # 9999 is the FastAPI daemon baked into the sandbox image (see
+      # ``containers/sandbox-entrypoint.sh`` — daemon mode is the default).
+      - SANDBOX_URL=http://sandbox:9999
+      - BUGGY_NEO4J_URI=bolt://neo4j:7687
+      - BUGGY_NEO4J_USER=neo4j
+      - BUGGY_NEO4J_PASSWORD=${NEO4J_PASSWORD:-buggy-graph}
+      # Skillogy is the canonical skill-retrieval backend (Neo4j-backed,
+      # phase-scoped retrieval). The in-process file-system
+      # ``SkillsMiddleware`` stays available as an explicit opt-out via
+      # ``BUGGY_USE_SKILLOGY=0`` for standalone library use and
+      # pytest where the skillogy container isn't running.
+      - BUGGY_USE_SKILLOGY=${BUGGY_USE_SKILLOGY:-1}
+      - BUGGY_SKILLOGY_URL=http://skillogy:9100
+      # Neo4j is the sole KG backend (no BUGGY_KG_BACKEND needed)
+      # BENCHMARK_MODE flows in via `env_file: .env` above — no need to
+      # re-declare it here. Set BENCHMARK_MODE=1 in .env to engage CTF/XBOW
+      # benchmark mode (rule overrides + challenge context inject).
+    volumes:
+      # Mount the OAuth credential files read-only so the LLM factory can
+      # check file presence + valid JSON before adding a method to the
+      # fallback chain. Without this the factory would trust the
+      # ``BUGGY_AUTH_*`` boolean alone and a stale flag
+      # (e.g. ``codex logout`` after onboard) would generate a 401-fallback
+      # storm. Read-only because langgraph never refreshes tokens — that's
+      # the LiteLLM container's job.
+      - ${CLAUDE_CREDENTIALS_VOLUME:-/dev/null}:/root/.claude/.credentials.json:ro
+      - ${CODEX_AUTH_VOLUME:-/dev/null}:/root/.codex/auth.json:ro
+      # Devin CLI (agent-level subscription, `devin_delegate`). The binary
+      # is platform-specific — the container needs the LINUX build even on
+      # a macOS host (fetch from static.devin.ai per the install manifest).
+      # Credentials are shared read-only with the host CLI install; session
+      # state (sessions.db) stays in the container layer. Both default to
+      # /dev/null so deployments without Devin keep working unchanged.
+      - ${DEVIN_BIN_VOLUME:-/dev/null}:/usr/local/bin/devin:ro
+      - ${DEVIN_CREDENTIALS_VOLUME:-/dev/null}:/root/.local/share/devin/credentials.toml:ro
+      # Telemetry identity. The anonymous install_id is minted under
+      # $BUGGY_HOME/telemetry; without this mount it lived only in the
+      # container's writable layer, so every image update minted a NEW id
+      # (measured: 95% of "installs" survived a single day). Persisting it here
+      # also makes the agent and the host CLI agree on one id.
+      - ${BUGGY_HOME:-~/.buggy}/telemetry:/root/.buggy/telemetry
+    # Wait for litellm to be healthy: langgraph has retry logic but the launcher
+    # uses `compose up --wait` and needs healthy as the single readiness signal.
+    depends_on:
+      litellm:
+        condition: service_healthy
+      sandbox:
+        condition: service_started
+      neo4j:
+        condition: service_healthy
+    # python urllib — same pattern as the litellm healthcheck. Runs entirely
+    # inside the container so host OS (Linux / macOS / Windows) is irrelevant;
+    # avoids relying on curl/wget being present in the langgraph base image.
+    # start_period covers a cold FastAPI + all-graph import on slower hosts
+    # after litellm flips healthy; retries is post-cushion grace.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:2024/ok')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 180s
+    networks:
+      # buggy-net: reach litellm, postgres, neo4j (infra plane).
+      # sandbox-net: reach the sandbox container's HTTP daemon
+      # (HTTPSandbox transport) on the same bridge neo4j uses, while
+      # keeping the sandbox itself isolated from the infra plane.
+      - buggy-net
+      - sandbox-net
+    restart: unless-stopped
+    logging: *default-logging
+
+
+  # Web Dashboard — Next.js UI
+  # Migrations run automatically at startup via web-entrypoint.sh (prisma migrate deploy).
+  web:
+    image: buggy-web:${BUGGY_VERSION:-stable}
+    build:
+      context: .
+      dockerfile: containers/web.Dockerfile
+      args:
+        VERSION: ${VERSION:-0.0.0}
+    container_name: buggy${BUGGY_STACK_NAME:+-${BUGGY_STACK_NAME}}-web
+    ports:
+      - "127.0.0.1:${WEB_PORT:-3000}:3000"
+      - "127.0.0.1:${TERMINAL_PORT:-3003}:3003"
+    env_file: .env
+    environment:
+      - NEXT_PUBLIC_BUGGY_EDITION=oss
+      - LANGGRAPH_API_URL=http://langgraph:2024
+      - NEXT_PUBLIC_LANGGRAPH_API_URL=http://localhost:${LANGGRAPH_PORT:-2024}
+      - NEXT_PUBLIC_TERMINAL_WS_URL=ws://localhost:${TERMINAL_PORT:-3003}
+      - DATABASE_URL=postgresql://buggy:${POSTGRES_PASSWORD:-buggy}@postgres:5432/buggy_web
+      - WORKSPACE_PATH=/workspace
+    volumes:
+      - ${BUGGY_HOME:-~/.buggy}/workspace:/workspace
+    depends_on:
+      langgraph:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    # node http.get — Next.js standalone images include node but not curl/wget.
+    # `r.resume()` drains the body so the request finishes; without it the
+    # callback can resolve before close, leaving the process hanging until
+    # docker's healthcheck timeout fires. start_period covers prisma migrate
+    # + Next.js boot; retries is post-cushion grace.
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/', r => { r.resume(); process.exit(r.statusCode < 500 ? 0 : 1); }).on('error', () => process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 90s
+    networks:
+      - buggy-net
+    restart: unless-stopped
+    logging: *default-logging
+    # v1.1.8: web dashboard is no longer brought up by default `buggy
+    # start`. The CLI exposes a `/web` slash command that runs
+    # `docker compose --profile web up -d web` against the operator's
+    # docker daemon (the CLI container has the host docker.sock mounted
+    # in OSS), so the web tier only spins up when the operator actually
+    # asks for it. Keeps idle cost low and removes the postgres-migration
+    # latency hit from cold starts.
+    profiles:
+      - web
+
+  # Ink CLI — Interactive terminal UI
+  # Runs via: docker compose run --rm cli
+  cli:
+    image: buggy-cli:${BUGGY_VERSION:-stable}
+    build:
+      context: .
+      dockerfile: containers/cli.Dockerfile
+      args:
+        VERSION: ${VERSION:-0.0.0}
+    container_name: buggy${BUGGY_STACK_NAME:+-${BUGGY_STACK_NAME}}-cli
+    stdin_open: true
+    tty: true
+    # v1.1.8 `/web` slash command: the CLI shells out to `docker compose
+    # --profile web up -d web` against the host docker daemon. To do
+    # that it needs (a) the docker.sock so commands reach the host
+    # daemon and (b) the on-host compose project directory mounted at a
+    # known in-container path so `-f` and `--env-file` resolve.
+    #
+    # OSS scope: user == host owner. Multi-tenant deployments never
+    # expose the docker socket to a tenant CLI — those deployments
+    # override this service's volumes via a compose overlay.
+    environment:
+      - BUGGY_API_URL=http://langgraph:2024
+      - TERM=xterm-256color
+      - COLORTERM=truecolor
+      - BUGGY_VERSION=${BUGGY_VERSION:-}
+      - BUGGY_STACK_NAME=${BUGGY_STACK_NAME:-}
+      - BUGGY_HOME=${BUGGY_HOME:-~/.buggy}
+      - BUGGY_COMPOSE_FILE=${BUGGY_HOME:-~/.buggy}/docker-compose.yml
+      - BUGGY_COMPOSE_ENV_FILE=${BUGGY_HOME:-~/.buggy}/.env
+      - BUGGY_COMPOSE_PROJECT=buggy${BUGGY_STACK_NAME:+-${BUGGY_STACK_NAME}}
+      - WEB_PORT=${WEB_PORT:-3000}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${BUGGY_HOME:-~/.buggy}:${BUGGY_HOME:-~/.buggy}
+    # Do NOT override WORKDIR — the cli image's entrypoint is
+    # `node dist/index.js` resolved relative to /app (set by
+    # containers/cli.Dockerfile). The slash command resolves the
+    # compose project via the BUGGY_COMPOSE_FILE / _ENV_FILE
+    # env vars above, so working_dir on this container is irrelevant.
+    depends_on:
+      langgraph:
+        condition: service_healthy
+    networks:
+      - buggy-net
+    profiles:
+      - cli
+
+  # ── C2 Infrastructure (profile-based, default: c2-sliver) ───────────
+  # Each C2 framework runs as a profile-based service on sandbox-net.
+  # ADR-0006 (v1.1.8+): C2 frameworks are opt-in workloads spawned by
+  # the orchestrator agent through opscontrol — the orchestrator calls
+  # `ops_start("c2-sliver")` after gaining a foothold. Default
+  # `buggy start` keeps the C2 plane cold.
+  # Swap framework: change `ops_start("c2-sliver")` to
+  # `ops_start("c2-havoc")` once that workload ships.
+  # Agent connects via: sliver-client (pre-installed in sandbox)
+  c2-sliver:
+    image: buggy-c2-sliver:${BUGGY_VERSION:-stable}
+    # Multi-arch image — see buggy-sandbox above for the same notes.
+    build:
+      context: .
+      dockerfile: containers/c2-sliver.Dockerfile
+    container_name: buggy${BUGGY_STACK_NAME:+-${BUGGY_STACK_NAME}}-c2-sliver
+    networks:
+      - sandbox-net
+    cap_add:
+      - NET_BIND_SERVICE
+    volumes:
+      - sliver_data:/home/sliver/.sliver
+    pids_limit: 512
+    restart: unless-stopped
+    logging: *default-logging
+    profiles:
+      - c2-sliver
+
+  # ─── Optional: OpenTelemetry collector for self-hosted traces ──────────
+  # Uncomment to receive Buggy spans locally (Jaeger all-in-one).
+  # Buggy stays default-off; set OTEL_ENABLED=1 plus the env vars below
+  # in the langgraph service to actually emit spans.
+  #
+  # jaeger:
+  #   image: jaegertracing/all-in-one:1.60
+  #   container_name: buggy${BUGGY_STACK_NAME:+-${BUGGY_STACK_NAME}}-jaeger
+  #   environment:
+  #     - COLLECTOR_OTLP_ENABLED=true
+  #   ports:
+  #     - "127.0.0.1:${JAEGER_UI_PORT:-16686}:16686"
+  #     - "127.0.0.1:${OTEL_HTTP_PORT:-4318}:4318"
+  #   networks:
+  #     - buggy-net
+  #
+  # To export Buggy spans to this service, set on the langgraph service:
+  #   - OTEL_ENABLED=1
+  #   - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318/v1/traces
+  #   - OTEL_SERVICE_NAME=buggy
+
+  skillogy:
+    image: buggy-skillogy:${BUGGY_VERSION:-stable}
+    build:
+      context: .
+      dockerfile: containers/skillogy.Dockerfile
+    container_name: buggy${BUGGY_STACK_NAME:+-${BUGGY_STACK_NAME}}-skillogy
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      # Boot-time embedding backfill (ADR-0011) calls the litellm proxy.
+      # Wait for it to be healthy so the first ingest can embed the corpus;
+      # if it were absent the ingest degrades to substring-only retrieval.
+      litellm:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${SKILLOGY_REST_PORT:-9100}:9100"
+    environment:
+      - SKILLOGY_REST_PORT=9100
+      - SKILLOGY_NEO4J_URI=bolt://neo4j:7687
+      - SKILLOGY_NEO4J_USER=neo4j
+      - SKILLOGY_NEO4J_PASSWORD=${NEO4J_PASSWORD:-buggy-graph}
+      # Hybrid retrieval embeds skills + queries through the same litellm
+      # proxy the agents use (ADR-0011 §"Skillogy↔litellm coupling").
+      # Unset → find_skill falls back to substring search.
+      - BUGGY_LLM__PROXY_URL=http://litellm:4000
+      - BUGGY_LLM__PROXY_API_KEY=${LITELLM_MASTER_KEY:-sk-buggy-master}
+      - BUGGY_SKILLOGY_EMBED_MODEL=${BUGGY_SKILLOGY_EMBED_MODEL:-openai/text-embedding-3-small}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9100/v1/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 30s
+    networks:
+      - buggy-net
+    restart: unless-stopped
+    logging: *default-logging
+
+  # ── BloodHound Community Edition (BHCE) sidecar ────────────────────
+  #
+  # Provides the AD attack-graph layer for the agent.  Replaces the
+  # in-house tools/ad/* ingest + ADCS post-process (PR #560..#578),
+  # which are deprecated by ADR-0005.  The agent calls BHCE v9.2.2
+  # over its official REST API via buggy.tools.ad.bhce_client.
+  #
+  # Why a dedicated Neo4j: Neo4j Community Edition only allows one
+  # user database per server, and our KGStore already occupies the
+  # `neo4j` database on the `neo4j` container.  BHCE writes its own
+  # ADCS / AD label schema via its `dawgs` driver, so it gets its
+  # own Neo4j instance to avoid label/constraint collisions.
+  # See docs/adr/0005-bloodhound-via-bhce-rest-client.md §Context.
+  #
+  # Why reuse Postgres: BHCE only needs one Postgres database
+  # (`bloodhound`) with the `pg_trgm` extension.  The idempotent
+  # `bhce-postgres-init` sidecar below creates/repairs that state on
+  # both fresh installs and upgrades with an existing `postgres_data`
+  # volume, so users do not have to delete data after BHCE is added.
+  bhce-postgres-init:
+    image: postgres:17-alpine
+    container_name: buggy${BUGGY_STACK_NAME:+-${BUGGY_STACK_NAME}}-bhce-postgres-init
+    environment:
+      POSTGRES_USER: buggy
+      POSTGRES_DB: litellm
+      PGPASSWORD: ${POSTGRES_PASSWORD:-buggy}
+      PGHOST: postgres
+      BHCE_POSTGRES_DB: ${BHCE_POSTGRES_DB:-bloodhound}
+      BHCE_POSTGRES_USER: ${BHCE_POSTGRES_USER:-bloodhound}
+      BHCE_POSTGRES_PASSWORD: ${BHCE_POSTGRES_PASSWORD:-bhce-buggy-local}
+    volumes:
+      - ./containers/postgres-init/02-bloodhound-db.sh:/buggy/ensure-bloodhound-db.sh:ro
+    command:
+      - bash
+      - -c
+      - |
+        bash /buggy/ensure-bloodhound-db.sh
+        exec sleep 2147483647
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          test "$$(psql -v ON_ERROR_STOP=1 --username "$${POSTGRES_USER}" --dbname "$${BHCE_POSTGRES_DB}" -tAc "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm')")" = "t"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+    networks:
+      - buggy-net
+    # ADR-0006 §3 — workload is opt-in via the opscontrol daemon.
+    # Default `buggy start` does NOT bring this up; the agent
+    # spawns it on demand via `ops_start("ad")`.
+    profiles:
+      - ad
+  bhce-neo4j:
+    image: neo4j:4.4.48-community
+    container_name: buggy${BUGGY_STACK_NAME:+-${BUGGY_STACK_NAME}}-bhce-neo4j
+    environment:
+      NEO4J_AUTH: neo4j/${BHCE_NEO4J_PASSWORD:-buggy-bhce-graph}
+      NEO4J_dbms_allow__upgrade: "true"
+    volumes:
+      - bhce_neo4j_data:/data
+      - bhce_neo4j_logs:/logs
+    networks:
+      - buggy-net
+    # No host port exposure: only the BHCE API container needs bolt.
+    # `docker exec` into this container for cypher-shell debugging.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -O /dev/null -q http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    restart: unless-stopped
+    logging: *default-logging
+    # ADR-0006 §3 — opt-in via `ops_start("ad")`. Default
+    # `buggy start` does not spin up the AD graph DB.
+    profiles:
+      - ad
+
+  bhce:
+    # SpecterOps does not publish semver tags on Docker Hub — every
+    # build is `edge` or `sha-<commit>[-<timestamp>]`.  Default below
+    # pins the v9.2.2 release commit (1a7b3df, 2026-06-01).  Verify
+    # against https://github.com/SpecterOps/BloodHound/releases/tag/v9.2.2
+    # when bumping; tags are immutable on Hub but `edge` is not.
+    image: docker.io/specterops/bloodhound:${BHCE_TAG:-sha-1a7b3df18a836051643ea3dcb777d20abdb469de}
+    container_name: buggy${BUGGY_STACK_NAME:+-${BUGGY_STACK_NAME}}-bhce
+    environment:
+      # Cypher policy: keep the v9.2.2 defaults — complexity limit on,
+      # mutations disabled.  Flip via env if a red-team scenario
+      # demands write-cypher (rare; tracked in ADR-0005 follow-up).
+      bhe_disable_cypher_complexity_limit: "false"
+      bhe_enable_cypher_mutations: "false"
+      bhe_graph_query_memory_limit: "2"
+      # External Postgres — our existing `postgres` container, with
+      # the `bloodhound` DB + `pg_trgm` ensured by the idempotent
+      # `bhce-postgres-init` sidecar above.
+      bhe_database_connection: >-
+        user=${BHCE_POSTGRES_USER:-bloodhound}
+        password=${BHCE_POSTGRES_PASSWORD:-bhce-buggy-local}
+        dbname=${BHCE_POSTGRES_DB:-bloodhound}
+        host=postgres
+        sslmode=disable
+      # External Neo4j — dedicated `bhce-neo4j` container.
+      bhe_neo4j_connection: "neo4j://neo4j:${BHCE_NEO4J_PASSWORD:-buggy-bhce-graph}@bhce-neo4j:7687/"
+      bhe_graph_driver: "neo4j"
+      bhe_recreate_default_admin: "${BHCE_RECREATE_DEFAULT_ADMIN:-false}"
+      bhe_default_admin_email: "${BHCE_DEFAULT_ADMIN_EMAIL:-admin@buggy.local}"
+      bhe_default_admin_password: "${BHCE_DEFAULT_ADMIN_PASSWORD:-BuggyBhceLocal2026!}"
+      bhe_default_admin_principal_name: "${BHCE_DEFAULT_ADMIN_USERNAME:-admin}"
+      # JWT signing key — pin this to a persisted secret in any
+      # non-dev deployment; default value is for local dogfood only.
+      bhe_crypto_jwt_signing_key: "${BHCE_JWT_SIGNING_KEY:-buggy-bhce-jwt-signing-key-do-not-use-in-prod-do-not-use-in-prod}"
+    ports:
+      - "127.0.0.1:${BHCE_PORT:-8081}:8080"
+    networks:
+      - buggy-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      bhce-postgres-init:
+        condition: service_healthy
+      bhce-neo4j:
+        condition: service_healthy
+    # The upstream image is distroless: no `/bin/sh`, curl, wget, or Python.
+    # Docker Compose `up --wait` rejects services with no healthcheck, so use
+    # the only executable the image provides as a liveness check. API clients
+    # still perform the real readiness probe/retry against `/api/v2/spec`;
+    # this check exists to keep compose wait semantics from failing before the
+    # client-level readiness loop can run.
+    healthcheck:
+      test: ["CMD", "/bloodhound", "-version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    logging: *default-logging
+    # ADR-0006 §3 — workload is opt-in. The orchestrator agent calls
+    # `ops_start("ad")` after recon identifies an AD environment;
+    # default `buggy start` keeps the BHCE plane cold.
+    profiles:
+      - ad
+
+volumes:
+  postgres_data:
+  sliver_data:
+  neo4j_data:
+  neo4j_logs:
+  bhce_neo4j_data:
+  bhce_neo4j_logs:
+
+networks:
+  buggy-net:
+    driver: bridge
+  sandbox-net:
+    driver: bridge

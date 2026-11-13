@@ -1,0 +1,61 @@
+[project]
+name = "buggy-sdk"
+version = "0.0.0"
+description = "Buggy plugin author SDK: protocols, fixtures, scaffolding"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.13"
+
+authors = [
+    { name = "Buggy Team" }
+]
+
+keywords = [
+    "ai", "security", "red-team", "agents", "plugins", "sdk"
+]
+
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Typing :: Typed",
+]
+
+dependencies = [
+    "buggy-core",
+    # Modern typer (>=0.12) bundles rich + shellingham by default and
+    # dropped the ``[all]`` extra; depending on ``typer[all]`` only emits
+    # a "no extra named all" warning at install time.
+    "typer>=0.9.0",
+]
+
+[project.optional-dependencies]
+# Test fixtures (FakeBackend, FakeLLM, FakeSandbox, etc.) ship under
+# ``buggy_sdk.testing`` but require pytest-asyncio at runtime.
+testing = ["pytest>=8.0.0", "pytest-asyncio>=0.23.0"]
+# Live fixtures that wrap a real (mocked) framework instance pull the
+# framework in as an opt-in extra — keeps `pip install buggy-sdk`
+# lean for the pure-protocols path.
+fixtures = ["buggy"]
+
+[project.scripts]
+# ``buggy-sdk plugin new --kind=... --name=... --path=...`` —
+# scaffolds a buildable plugin package for one of the six supported
+# plugin kinds (tool / middleware / agent / callback / skill / prompt).
+# Source at ``buggy_sdk.scaffold.cli``.
+buggy-sdk = "buggy_sdk.scaffold.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/saivarun3407/buggy"
+Repository = "https://github.com/saivarun3407/buggy"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["buggy_sdk"]

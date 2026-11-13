@@ -1,0 +1,67 @@
+# docker-compose.watch.yml — hot-reload overrides for development
+#
+# Requires Docker Compose 2.22+ (introduces the `develop.watch` key).
+# Kept separate from docker-compose.yml so OSS users on older Compose
+# versions don't hit "Additional property develop is not allowed".
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.watch.yml watch
+#   # or via make:
+#   make dev
+services:
+  langgraph:
+    develop:
+      watch:
+        - action: sync
+          # Phase 0 of the core/framework/sdk split relocated the source
+          # tree to packages/buggy/buggy/. The Dockerfile
+          # COPY now pulls packages/, and uv sync installs editable from
+          # there — hot-reload mirrors the same path inside the image.
+          # Skills live under packages/buggy/buggy/skills,
+          # so this sync covers them too — no dedicated entry needed.
+          path: ./packages/buggy/buggy
+          target: /app/packages/buggy/buggy
+        - action: sync
+          # buggy-core changes also live-sync into the editable
+          # install so plugin registry / role registry tweaks land
+          # without a full image rebuild.
+          path: ./packages/buggy-core/buggy_core
+          target: /app/packages/buggy-core/buggy_core
+        - action: sync
+          path: ./langgraph.json
+          target: /app/langgraph.json
+        - action: rebuild
+          # Any workspace pyproject change forces a rebuild — uv sync
+          # must re-resolve the dependency closure.
+          path: ./pyproject.toml
+        - action: rebuild
+          path: ./packages/buggy/pyproject.toml
+        - action: rebuild
+          path: ./packages/buggy-core/pyproject.toml
+        - action: rebuild
+          path: ./containers/langgraph.Dockerfile
+
+  web:
+    develop:
+      watch:
+        - action: sync
+          path: ./clients/web/src
+          target: /app/clients/web/src
+        - action: sync
+          path: ./clients/web/public
+          target: /app/clients/web/public
+        - action: rebuild
+          path: ./clients/web/package.json
+        - action: rebuild
+          path: ./containers/web.Dockerfile
+
+  cli:
+    develop:
+      watch:
+        - action: sync
+          path: ./clients/cli/src
+          target: /app/src
+        - action: rebuild
+          path: ./clients/cli/package.json
+        - action: rebuild
+          path: ./containers/cli.Dockerfile

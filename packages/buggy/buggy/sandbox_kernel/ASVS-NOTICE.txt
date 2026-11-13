@@ -1,0 +1,21 @@
+OWASP Application Security Verification Standard 5.0.0
+
+Attribution: OWASP ASVS project and contributors.
+License: Creative Commons Attribution-ShareAlike 4.0 International (CC-BY-SA-4.0).
+License terms: https://creativecommons.org/licenses/by-sa/4.0/
+Upstream license: https://github.com/OWASP/ASVS/blob/5cf9b032440be53ce345ab3c130fda46ba1ce7a2/LICENSE.md
+
+This distribution includes an unmodified copy of the English JSON release:
+OWASP_Application_Security_Verification_Standard_5.0.0_en.json
+Release: https://github.com/OWASP/ASVS/releases/tag/v5.0.0_release
+Upstream commit: 5cf9b032440be53ce345ab3c130fda46ba1ce7a2
+SHA-256: bcdbec214d70abcfad9284a31d4f9e5134305831d628aad3aa85d7e26626cb35
+
+The catalog reader selects and restructures records without changing the
+requirement text. The catalog content retains its CC-BY-SA-4.0 license;
+it does not relicense Buggy's application code.
+
+The licensed material is provided AS-IS and AS-AVAILABLE, without warranties
+or liability to the extent permitted by law; see Section 5 of the license.
+No OWASP endorsement, certification, or verification of assessment results
+is implied.

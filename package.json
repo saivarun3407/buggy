@@ -1,0 +1,30 @@
+{
+  "name": "buggy",
+  "private": true,
+  "workspaces": [
+    "clients/*",
+    "clients/shared/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace=clients/web",
+    "build": "npm run build --workspace=clients/web",
+    "start": "npm run start --workspace=clients/web",
+    "desktop": "npm run start --workspace=@buggy/desktop",
+    "desktop:test": "npm test --workspace=@buggy/desktop",
+    "prisma:generate": "npm run prisma:generate --workspace=clients/web",
+    "prisma:migrate": "npm run prisma:migrate --workspace=clients/web"
+  },
+  "dependencies": {
+    "@prisma/client": "^7.7.0"
+  },
+  "devDependencies": {
+    "prisma": "^7.7.0"
+  },
+  "overrides": {
+    "fast-uri": "^3.1.2",
+    "langsmith": "0.6.3",
+    "@langchain/core": {
+      "langsmith": "0.6.3"
+    }
+  }
+}

@@ -1,0 +1,28 @@
+# docker-compose.tun.yml — opt-in TUN device for Layer-3 pivoting
+#
+# ligolo-ng's Layer-3 pivot (baked into the base sandbox image) builds a
+# `tun` interface, which needs BOTH NET_ADMIN (granted by the sandbox
+# service in docker-compose.yml) AND the host /dev/net/tun device node.
+#
+# The device is NOT mapped in the base compose file: an unconditional
+# `devices:` mapping makes `compose up` fail on any host whose kernel has
+# no tun module, which would make TUN a hard prerequisite for every
+# sandbox user — including the majority who never run a Layer-3 pivot.
+# This overlay adds the device only when the operator opts in, mirroring
+# the docker-compose.dev.yml / docker-compose.watch.yml overlay pattern.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.tun.yml up -d sandbox
+#   # or with the dev overlay chain:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml \
+#     -f docker-compose.tun.yml up -d sandbox
+#
+# Requires the host `tun` module: `lsmod | grep tun` — load with
+# `sudo modprobe tun` if absent (present by default on most Linux hosts
+# and the Docker Desktop / Podman-machine VMs). Mapping the node in
+# (rather than adding the MKNOD capability) keeps the privilege delta to a
+# single device, not a new capability.
+services:
+  sandbox:
+    devices:
+      - /dev/net/tun:/dev/net/tun

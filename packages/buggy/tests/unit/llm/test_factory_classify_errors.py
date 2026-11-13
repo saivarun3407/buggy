@@ -1,0 +1,357 @@
+"""Unit tests for ``_classify_provider_error`` + fatal-vs-retryable labelling.
+
+Background: ``_reraise_with_actionable_message`` already handles 400/401/404/429,
+but a caller (or human reading CLI output) cannot tell *retryable* (worth a
+fallback hop) from *fatal* (no auth swap will fix it). The classifier returns
+a tiny tag so the surfaced message can drop the misleading
+"configure another auth method" hint on fatal cases while preserving today's
+behavior for transient ones (#107 follow-up).
+"""
+
+from __future__ import annotations
+
+import httpx
+import pytest
+
+from buggy.llm.factory import (
+    LLMTimeoutError,
+    _classify_provider_error,
+    _reraise_with_actionable_message,
+)
+
+
+def _exc_with_status(name: str, status: int, msg: str = "") -> Exception:
+    """Build a synthetic provider-style exception that mirrors what LiteLLM /
+    openai surface in the wild — class name encodes the error kind and a
+    ``status_code`` attribute matches ``openai.APIStatusError``.
+    """
+    cls = type(name, (Exception,), {})
+    exc = cls(msg or f"Error code: {status}")
+    exc.status_code = status  # type: ignore[attr-defined]
+    return exc
+
+
+def _exc_with_malformed_status_and_response(
+    name: str, nested_status: int, msg: str = ""
+) -> Exception:
+    cls = type(name, (Exception,), {})
+    exc = cls(msg or "provider request failed")
+    exc.status_code = "unknown"  # type: ignore[attr-defined]
+    response_cls = type("ProviderResponse", (), {"status_code": nested_status})
+    exc.response = response_cls()  # type: ignore[attr-defined]
+    return exc
+
+
+class TestClassifyProviderErrorRetryable:
+    """Transient failures the agent (or LiteLLM retry layer) can recover from."""
+
+    def test_429_rate_limit_is_retryable(self):
+        assert _classify_provider_error(_exc_with_status("RateLimitError", 429)) == "retryable"
+
+    def test_503_service_unavailable_is_retryable(self):
+        assert (
+            _classify_provider_error(_exc_with_status("ServiceUnavailableError", 503))
+            == "retryable"
+        )
+
+    def test_500_internal_server_error_is_retryable(self):
+        assert _classify_provider_error(_exc_with_status("InternalServerError", 500)) == "retryable"
+
+    def test_llm_timeout_error_is_retryable(self):
+        assert _classify_provider_error(LLMTimeoutError("timed out after 600s")) == "retryable"
+
+    def test_httpx_connect_error_is_retryable(self):
+        assert _classify_provider_error(httpx.ConnectError("connection refused")) == "retryable"
+
+    def test_httpx_read_timeout_is_retryable(self):
+        assert _classify_provider_error(httpx.ReadTimeout("read timed out")) == "retryable"
+
+    def test_message_only_5xx_is_retryable(self):
+        # No status_code attribute; classifier must fall back to message regex
+        # (LiteLLM surface for proxied errors).
+        exc = Exception("litellm.APIError: Error code: 502 - upstream bad gateway")
+        assert _classify_provider_error(exc) == "retryable"
+
+
+class TestClassifyProviderErrorFatal:
+    """4xx auth/config failures — no retry, no auth swap, will fix nothing."""
+
+    def test_400_bad_request_is_fatal(self):
+        assert _classify_provider_error(_exc_with_status("BadRequestError", 400)) == "fatal"
+
+    def test_401_authentication_is_fatal(self):
+        assert _classify_provider_error(_exc_with_status("AuthenticationError", 401)) == "fatal"
+
+    def test_403_forbidden_is_fatal(self):
+        assert _classify_provider_error(_exc_with_status("PermissionDeniedError", 403)) == "fatal"
+
+    def test_404_not_found_is_fatal(self):
+        assert _classify_provider_error(_exc_with_status("NotFoundError", 404)) == "fatal"
+
+    def test_message_only_400_is_fatal(self):
+        exc = Exception("Error code: 400 - parameter 'temperature' is deprecated")
+        assert _classify_provider_error(exc) == "fatal"
+
+    def test_malformed_top_level_status_falls_back_to_nested_400(self):
+        exc = _exc_with_malformed_status_and_response("APIStatusError", 400)
+        assert _classify_provider_error(exc) == "fatal"
+
+
+class TestActionableMessageFatalLabel:
+    """Integration with ``_reraise_with_actionable_message``: fatal classes
+    must carry the ``non-retryable provider error`` marker so callers /
+    operators stop chasing transient explanations."""
+
+    def test_400_message_labelled_non_retryable(self):
+        exc = _exc_with_status(
+            "BadRequestError",
+            400,
+            "Error code: 400 - temperature is deprecated",
+        )
+        with pytest.raises(RuntimeError) as info:
+            _reraise_with_actionable_message(exc, "anthropic/claude-opus-4-7")
+        msg = str(info.value)
+        assert "non-retryable provider error" in msg
+        # Existing remediation text preserved (regression).
+        assert "rejected the request (400)" in msg
+
+    def test_400_invalid_model_names_static_and_dynamic_proxy_configuration(self):
+        exc = _exc_with_status(
+            "BadRequestError",
+            400,
+            "Error code: 400 - Invalid model name passed in model=custom/kimi-k2.7-code. "
+            "Authorization: Bearer ***. Call `/v1/models` to view "
+            "available models for your key.",
+        )
+        with pytest.raises(RuntimeError) as info:
+            _reraise_with_actionable_message(exc, "custom/kimi-k2.7-code")
+
+        msg = str(info.value)
+        assert "non-retryable provider error" in msg
+        assert "config/litellm.yaml" in msg
+        assert "dynamic environment" in msg
+        assert "BUGGY_MODEL" in msg
+        assert "restart" in msg.lower()
+        assert "startup logs" in msg.lower()
+        assert "/v1/models" in msg
+        assert "ROUTELEAKTOKEN12345" not in msg
+        assert "[REDACTED]" in msg
+
+    def test_nested_400_with_malformed_top_level_status_reports_invalid_model(self):
+        exc = _exc_with_malformed_status_and_response(
+            "APIStatusError",
+            400,
+            "Invalid model name passed in model=custom/kimi-k2.7-code",
+        )
+        with pytest.raises(RuntimeError) as info:
+            _reraise_with_actionable_message(exc, "custom/kimi-k2.7-code")
+
+        msg = str(info.value)
+        assert "non-retryable provider error" in msg
+        assert "not available through the LiteLLM proxy" in msg
+
+    def test_503_invalid_model_text_is_not_reclassified_as_a_route_error(self):
+        exc = _exc_with_status(
+            "ServiceUnavailableError",
+            503,
+            "Error code: 503 - upstream temporarily returned Invalid model name",
+        )
+        assert _reraise_with_actionable_message(exc, "custom/kimi-k2.7-code") is None
+
+    def test_value_error_invalid_model_text_passes_through(self):
+        exc = ValueError("parser captured provider text: Invalid model name")
+        assert _reraise_with_actionable_message(exc, "custom/kimi-k2.7-code") is None
+
+    def test_composite_400_invalid_model_precedes_no_fallback_guidance(self):
+        exc = _exc_with_status(
+            "BadRequestError",
+            400,
+            "Error code: 400 - Invalid model name passed in model=custom/kimi-k2.7-code. "
+            "No fallback model group found for original model_group=custom/kimi-k2.7-code",
+        )
+        with pytest.raises(RuntimeError) as info:
+            _reraise_with_actionable_message(exc, "custom/kimi-k2.7-code")
+
+        msg = str(info.value)
+        assert "not available through the LiteLLM proxy" in msg
+        assert "another auth method" not in msg
+
+    def test_401_message_labelled_non_retryable(self):
+        exc = _exc_with_status("AuthenticationError", 401, "Error code: 401 - invalid_api_key")
+        with pytest.raises(RuntimeError) as info:
+            _reraise_with_actionable_message(exc, "openai/gpt-5.5")
+        msg = str(info.value)
+        assert "non-retryable provider error" in msg
+        assert "credentials (401)" in msg
+
+    def test_404_message_labelled_non_retryable(self):
+        exc = _exc_with_status("NotFoundError", 404, "Error code: 404 - model not found")
+        with pytest.raises(RuntimeError) as info:
+            _reraise_with_actionable_message(exc, "ollama_chat/nope")
+        msg = str(info.value)
+        assert "non-retryable provider error" in msg
+        assert "404" in msg
+
+    def test_429_message_unchanged_retryable_path(self):
+        # Retryable branch must NOT acquire the fatal label — would mislead
+        # operators into thinking the rate-limit isn't recoverable.
+        exc = _exc_with_status("RateLimitError", 429, "Error code: 429")
+        with pytest.raises(RuntimeError) as info:
+            _reraise_with_actionable_message(exc, "anthropic/claude-opus-4-7")
+        msg = str(info.value)
+        assert "non-retryable provider error" not in msg
+        assert "rate limit (429)" in msg
+
+
+class TestActionableMessage403Forbidden:
+    """403 PermissionDenied is a distinct fatal class. Before the fix the
+    helper had no branch for it, so it fell through to the caller's bare
+    ``raise`` — surfacing the raw provider exception (no remediation, and the
+    un-redacted body could leak an echoed Authorization header)."""
+
+    def test_403_by_status_attr_gives_actionable_message(self):
+        exc = _exc_with_status("PermissionDeniedError", 403, "Error code: 403 - forbidden")
+        with pytest.raises(RuntimeError) as info:
+            _reraise_with_actionable_message(exc, "anthropic/claude-opus-4-7")
+        msg = str(info.value)
+        assert "refused access (403)" in msg
+        assert "non-retryable provider error" in msg
+        assert "BUGGY_AUTH_PRIORITY" in msg
+
+    def test_403_message_only_gives_actionable_message(self):
+        exc = Exception("litellm.PermissionDeniedError: Error code: 403 - region not allowed")
+        with pytest.raises(RuntimeError) as info:
+            _reraise_with_actionable_message(exc, "openai/gpt-5.5")
+        assert "refused access (403)" in str(info.value)
+
+    def test_403_redacts_echoed_bearer_token(self):
+        exc = _exc_with_status(
+            "PermissionDeniedError",
+            403,
+            "Error code: 403 - Authorization: Bearer sk-ant-FORBIDDENLEAKTOKEN12345",
+        )
+        with pytest.raises(RuntimeError) as info:
+            _reraise_with_actionable_message(exc, "anthropic/claude-opus-4-7")
+        msg = str(info.value)
+        assert "sk-ant-FORBIDDENLEAKTOKEN12345" not in msg
+        assert "FORBIDDENLEAKTOKEN12345" not in msg
+        assert "[REDACTED]" in msg
+
+
+class TestUnclassifiedErrorSecretNet:
+    """Final safety net: an *unclassified* provider error (no 4xx branch
+    matched) whose body echoes a credential must be re-wrapped with the
+    scrubbed text instead of re-raised verbatim — otherwise the caller's
+    trailing ``raise`` would leak the secret into CLI output / logs."""
+
+    def test_unclassified_500_with_bearer_is_redacted_and_wrapped(self):
+        # 500 is retryable and not special-cased in the actionable branches,
+        # so it lands on the fallthrough. The echoed token must not survive.
+        exc = Exception(
+            "Error code: 500 - upstream error; sent Authorization: Bearer "
+            "sk-LEAKYINTERNALSERVERTOKEN9999"
+        )
+        with pytest.raises(RuntimeError) as info:
+            _reraise_with_actionable_message(exc, "openai/gpt-5.5")
+        msg = str(info.value)
+        assert "sk-LEAKYINTERNALSERVERTOKEN9999" not in msg
+        assert "LEAKYINTERNALSERVERTOKEN9999" not in msg
+        assert "[REDACTED]" in msg
+        assert "unclassified provider error" in msg
+
+    def test_unclassified_with_api_key_kwarg_is_redacted(self):
+        exc = Exception("weird upstream blob api_key=sk-ANOTHERLEAKEDVALUE0001 happened")
+        with pytest.raises(RuntimeError) as info:
+            _reraise_with_actionable_message(exc, "openai/gpt-5.5")
+        assert "sk-ANOTHERLEAKEDVALUE0001" not in str(info.value)
+        assert "[REDACTED]" in str(info.value)
+
+    def test_unrelated_error_without_credential_passes_through(self):
+        # No credential shape → helper must NOT raise; caller re-raises the
+        # original exception with its traceback intact (regression guard for
+        # the safety net's narrow trigger). A long model id alone (which the
+        # broad >=24-char redaction pattern matches) must not trip it.
+        exc = ValueError("planner produced no model for anthropic/claude-opus-4-7-experimental")
+        # Returns None (no raise).
+        assert _reraise_with_actionable_message(exc, "anthropic/claude-opus-4-7") is None
+
+
+@pytest.mark.parametrize(
+    "details",
+    [
+        "No deployments available for selected model",
+        "No deployments available; cooldown_list=['deployment-fixture']",
+    ],
+)
+def test_router_cooldown_identifies_unavailable_deployment(details: str) -> None:
+    exc = _exc_with_status("RouterRateLimitError", 429, f"Error code: 429 - {details}")
+    with pytest.raises(RuntimeError) as error:
+        _reraise_with_actionable_message(exc, "custom/fixture-model")
+    assert "no available deployments" in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "details",
+    [
+        "No deployments available for selected model",
+        "No deployments available; cooldown_list=['deployment-fixture']",
+    ],
+)
+def test_router_cooldown_does_not_claim_provider_quota(details: str) -> None:
+    exc = _exc_with_status("RouterRateLimitError", 429, f"Error code: 429 - {details}")
+    with pytest.raises(RuntimeError) as error:
+        _reraise_with_actionable_message(exc, "custom/fixture-model")
+    assert "hit the provider's rate limit (429)" not in str(error.value)
+
+
+def test_provider_cooldown_keeps_quota_exception_type() -> None:
+    exc = _exc_with_status("RateLimitError", 429, "Error code: 429 - cooldown")
+    with pytest.raises(RuntimeError) as error:
+        _reraise_with_actionable_message(exc, "custom/fixture-model")
+    assert type(error.value) is RuntimeError
+
+
+@pytest.mark.parametrize("marker", ["cooldown", "proxy", "invalid_api_key"])
+def test_echoed_credential_cannot_relabel_provider_quota(marker: str) -> None:
+    exc = _exc_with_status(
+        "RateLimitError",
+        429,
+        f"Error code: 429 - quota exceeded. Authorization: Bearer FIXTURE_{marker}_SENTINEL",
+    )
+    with pytest.raises(RuntimeError) as error:
+        _reraise_with_actionable_message(exc, "custom/fixture-model")
+    assert "hit the provider's rate limit (429)" in str(error.value)
+
+
+def test_credential_status_cannot_make_unknown_error_fatal() -> None:
+    exc = Exception("provider failed. Authorization: Bearer FIXTURE_http400_SENTINEL")
+    assert _classify_provider_error(exc) == "retryable"
+
+
+def test_credential_status_cannot_add_a_fatal_diagnostic() -> None:
+    exc = Exception("provider failed. Authorization: Bearer FIXTURE_http400_SENTINEL")
+    with pytest.raises(RuntimeError) as error:
+        _reraise_with_actionable_message(exc, "custom/fixture-model")
+    assert "non-retryable provider error" not in str(error.value)
+
+
+def test_credential_status_cannot_invent_a_bad_request() -> None:
+    exc = Exception("provider failed. Authorization: Bearer FIXTURE_http400_SENTINEL")
+    with pytest.raises(RuntimeError) as error:
+        _reraise_with_actionable_message(exc, "custom/fixture-model")
+    assert "rejected the request (400)" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "details",
+    [
+        "Provider quota exceeded; cooldown=60 seconds",
+        "Deployment in cooldown; retry in 60 seconds",
+        "Quota exceeded for deployment azure/fixture; cooldown=60 seconds",
+    ],
+)
+def test_provider_cooldown_keeps_quota_diagnostic(details: str) -> None:
+    exc = _exc_with_status("RateLimitError", 429, f"Error code: 429 - {details}")
+    with pytest.raises(RuntimeError) as error:
+        _reraise_with_actionable_message(exc, "custom/fixture-model")
+    assert "hit the provider's rate limit (429)" in str(error.value)

@@ -1,0 +1,54 @@
+# ── Build artifacts ──────────────────────────────────────────
+**/node_modules
+**/.next
+**/dist
+**/build
+**/*.tsbuildinfo
+
+# ── Version control ──────────────────────────────────────────
+.git
+.gitignore
+.gitattributes
+
+# ── IDE / Editor ─────────────────────────────────────────────
+.vscode
+.idea
+*.swp
+*.swo
+.DS_Store
+
+# ── Environment / secrets ────────────────────────────────────
+.env
+.env.local
+.env.*.local
+clients/web/.env
+clients/web/.env.*
+*.pem
+*.key
+
+# ── Test / coverage ──────────────────────────────────────────
+**/coverage
+**/.pytest_cache
+**/__pycache__
+**/*.pyc
+**/.ruff_cache
+**/.mypy_cache
+
+# ── Agent tooling state ─────────────────────────────────────
+**/.omc
+**/.claude
+.claude-flow
+
+# ── Logs ─────────────────────────────────────────────────────
+**/*.log
+**/npm-debug.log*
+
+# ── Heavy directories not needed by any Dockerfile ──────────
+# (skills/ IS needed by langgraph.Dockerfile — do not exclude)
+reference
+assets
+tests
+workspace
+
+# ── Client package caches ───────────────────────────────────
+clients/web/.next

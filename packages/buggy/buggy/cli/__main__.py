@@ -1,0 +1,80 @@
+"""``python -m buggy.cli`` dispatcher."""
+
+from __future__ import annotations
+
+import sys
+
+from buggy.cli.audit import main as audit_main
+from buggy.cli.auth import main as auth_main
+from buggy.cli.export_transcript import main as export_transcript_main
+from buggy.cli.scan import main as scan_main
+from buggy.cli.telemetry import main as telemetry_main
+from buggy.cli.zip import main as zip_main
+
+
+def _print_help() -> int:
+    print(
+        "buggy-cli — headless / CI entry\n\n"
+        "Subcommands:\n"
+        "  hunt               Start a hunt against a target in one command (simple)\n"
+        "  bounty             Start a HackerOne / Bugcrowd bounty via the Scout flow\n"
+        "  engage             Start an authorized engagement from target + scope lists\n"
+        "  scan               Run a one-shot security scan and emit SARIF\n"
+        "  assessment         Track web/API inventory and evidence-backed coverage\n"
+        "  workflows          Inspect capabilities and run bounded defensive workflows\n"
+        "  auth               Show provider/auth configuration (API keys + subscriptions)\n\n"
+        "  audit              Verify engagement audit ledgers\n"
+        "  zip                Export/import engagement workspaces as ZIP archives\n\n"
+        "  export-transcript  Render an engagement event log as Markdown\n\n"
+        "  telemetry          Inspect/control usage telemetry (status|preview|off|on)\n\n"
+        "Run a subcommand with --help for its flags.",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = list(argv if argv is not None else sys.argv[1:])
+    if not args or args[0] in {"-h", "--help"}:
+        return _print_help()
+    sub = args[0]
+    rest = args[1:]
+    if sub == "hunt":
+        from buggy.cli.hunt import main as hunt_main
+
+        return hunt_main(rest)
+    if sub == "bounty":
+        from buggy.cli.bounty import main as bounty_main
+
+        return bounty_main(rest)
+    if sub == "engage":
+        from buggy.cli.engage import main as engage_main
+
+        return engage_main(rest)
+    if sub == "assessment":
+        from buggy.cli.assessment import main as assessment_main
+
+        return assessment_main(rest)
+    if sub == "workflows":
+        from buggy.cli.workflows import main as workflows_main
+
+        return workflows_main(rest)
+    if sub == "scan":
+        return scan_main(rest)
+    if sub == "auth":
+        return auth_main(rest)
+    if sub == "audit":
+        return audit_main(rest)
+    if sub == "zip":
+        return zip_main(rest)
+    if sub == "export-transcript":
+        return export_transcript_main(rest)
+    if sub == "telemetry":
+        return telemetry_main(rest)
+    print(f"unknown subcommand: {sub}\n", file=sys.stderr)
+    _print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

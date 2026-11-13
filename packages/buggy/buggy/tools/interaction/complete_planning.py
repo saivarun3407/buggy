@@ -1,0 +1,56 @@
+"""complete_engagement_planning — signal soundwave-to-buggy handoff.
+
+Soundwave calls this exactly once after RoE / CONOPS / Deconfliction Plan
+have been written, validated, and saved to ``/workspace/plan/``. The
+emitted custom event tells the CLI to switch its LangGraph assistant_id from
+``soundwave`` to ``buggy`` so the next operator message lands on the
+operations agent without the operator restarting the CLI.
+
+The tool is a pure boolean signal — it carries no slug or other metadata.
+The launcher is the single source of truth for the engagement slug; clients
+inject ``engagement_name``/``workspace_path`` via ``config.configurable`` on
+every run, and EngagementContextMiddleware hydrates them into agent state.
+"""
+
+from __future__ import annotations
+
+from typing import Annotated, Any
+
+from langchain_core.tools import InjectedToolCallId, tool
+from langgraph.config import get_stream_writer
+
+
+def _safe_writer():
+    try:
+        return get_stream_writer()
+    except Exception:
+        return None
+
+
+@tool
+def complete_engagement_planning(
+    tool_call_id: Annotated[str, InjectedToolCallId] = "",
+) -> Any:
+    """Signal that engagement planning is finished and hand off to Buggy.
+
+    Call this tool exactly once, after RoE, CONOPS, and the Deconfliction Plan
+    have all been written under ``/workspace/plan/`` and validated against
+    their schemas. The CLI will switch the active assistant to Buggy and
+    the operator's next message starts the operations phase.
+
+    Returns:
+        A confirmation string the LLM can include in its closing message.
+    """
+    writer = _safe_writer()
+    if writer is not None:
+        writer(
+            {
+                "type": "engagement_ready",
+                "agent": "soundwave",
+                "id": tool_call_id,
+            }
+        )
+    return (
+        "Planning complete. The operator's next message will be routed to the "
+        "Buggy operations agent."
+    )

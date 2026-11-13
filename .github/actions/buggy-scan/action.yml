@@ -1,0 +1,166 @@
+name: "Buggy Security Scan"
+description: >
+  Run an autonomous red-team scan against the current repository using
+  Buggy, emit SARIF v2.1.0 results suitable for GitHub Code Scanning,
+  and fail the job when findings hit a configurable severity threshold.
+author: "PurpleAILAB"
+branding:
+  icon: "shield"
+  color: "purple"
+
+inputs:
+  target:
+    description: "Target to scan (path, URL, or git URL). Defaults to the checkout root."
+    required: false
+    default: "./"
+  scan-mode:
+    description: "Scan depth: quick | standard | deep."
+    required: false
+    default: "quick"
+  scope-mode:
+    description: >
+      'full' or 'diff'. 'diff' restricts the scan to files changed against
+      diff-base — recommended for PR-time gates.
+    required: false
+    default: "diff"
+  diff-base:
+    description: "Git ref to diff against when scope-mode=diff."
+    required: false
+    default: "origin/main"
+  fail-on:
+    description: >
+      Minimum severity that fails the job: critical | high | medium | low | none.
+    required: false
+    default: "high"
+  sarif-output:
+    description: "Path to write the SARIF file."
+    required: false
+    default: "buggy.sarif"
+  upload-sarif:
+    description: >
+      When 'true', uploads the SARIF to GitHub Code Scanning via
+      github/codeql-action/upload-sarif. Requires the workflow to have
+      security-events: write permission.
+    required: false
+    default: "true"
+  instruction:
+    description: "Free-form scan focus or scope instruction."
+    required: false
+    default: ""
+  instruction-file:
+    description: "Path to a rules-of-engagement / scope file."
+    required: false
+    default: ""
+  langgraph-url:
+    description: >
+      LangGraph platform URL. When unset, the action starts a local stack
+      from docker-compose for the duration of the scan and tears it down on exit.
+    required: false
+    default: ""
+  buggy-version:
+    description: "Buggy container tag to pull when starting a local stack."
+    required: false
+    default: "latest"
+
+outputs:
+  sarif-path:
+    description: "Filesystem path to the produced SARIF file."
+    value: ${{ steps.run.outputs.sarif-path }}
+  finding-count:
+    description: "Total number of findings in the SARIF report."
+    value: ${{ steps.run.outputs.finding-count }}
+  exit-code:
+    description: "Exit code returned by the scan: 0 ok, 1 findings ≥ threshold, 2/3 error."
+    value: ${{ steps.run.outputs.exit-code }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install Buggy CLI
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 -m pip install --upgrade pip
+        if [ -d packages/buggy ] && [ -d packages/buggy-core ]; then
+          python3 -m pip install -e ./packages/buggy-core
+          python3 -m pip install -e ./packages/buggy
+          python3 -m pip install langgraph-sdk
+        else
+          python3 -m pip install "buggy" "buggy-core" "langgraph-sdk"
+        fi
+
+    - name: Start local Buggy stack (when no remote URL supplied)
+      if: ${{ inputs.langgraph-url == '' }}
+      shell: bash
+      env:
+        BUGGY_VERSION: ${{ inputs.buggy-version }}
+      run: |
+        set -euo pipefail
+        if [ -f docker-compose.yml ] && grep -q 'buggy' docker-compose.yml; then
+          echo "Using repo docker-compose.yml"
+        else
+          curl -fsSL https://buggy.red/docker-compose.yml -o /tmp/buggy-compose.yml
+          export COMPOSE_FILE=/tmp/buggy-compose.yml
+        fi
+        docker compose up -d langgraph
+        for i in {1..120}; do
+          if curl -fsS http://localhost:2024/ok >/dev/null 2>&1; then
+            echo "LangGraph healthy"; break
+          fi
+          sleep 2
+        done
+
+    - name: Run scan
+      id: run
+      shell: bash
+      env:
+        BUGGY_API_URL: ${{ inputs.langgraph-url || 'http://localhost:2024' }}
+        DEC_TARGET: ${{ inputs.target }}
+        DEC_SCAN_MODE: ${{ inputs.scan-mode }}
+        DEC_SCOPE_MODE: ${{ inputs.scope-mode }}
+        DEC_DIFF_BASE: ${{ inputs.diff-base }}
+        DEC_SARIF_OUTPUT: ${{ inputs.sarif-output }}
+        DEC_FAIL_ON: ${{ inputs.fail-on }}
+        DEC_INSTRUCTION: ${{ inputs.instruction }}
+        DEC_INSTRUCTION_FILE: ${{ inputs.instruction-file }}
+      run: |
+        set +e
+        EXTRA_ARGS=()
+        if [ -n "${DEC_INSTRUCTION}" ]; then
+          EXTRA_ARGS+=(--instruction "${DEC_INSTRUCTION}")
+        fi
+        if [ -n "${DEC_INSTRUCTION_FILE}" ]; then
+          EXTRA_ARGS+=(--instruction-file "${DEC_INSTRUCTION_FILE}")
+        fi
+        python3 -m buggy.cli scan \
+          --target "${DEC_TARGET}" \
+          --scan-mode "${DEC_SCAN_MODE}" \
+          --scope-mode "${DEC_SCOPE_MODE}" \
+          --diff-base "${DEC_DIFF_BASE}" \
+          --sarif-output "${DEC_SARIF_OUTPUT}" \
+          --fail-on "${DEC_FAIL_ON}" \
+          --non-interactive \
+          "${EXTRA_ARGS[@]}"
+        EXIT=$?
+        echo "exit-code=$EXIT" >> "$GITHUB_OUTPUT"
+        echo "sarif-path=${DEC_SARIF_OUTPUT}" >> "$GITHUB_OUTPUT"
+        if [ -f "${DEC_SARIF_OUTPUT}" ]; then
+          COUNT=$(python3 -c "import json,sys,os; d=json.load(open(os.environ['DEC_SARIF_OUTPUT'])); print(sum(len(r.get('results',[])) for r in d.get('runs',[])))")
+        else
+          COUNT=0
+        fi
+        echo "finding-count=$COUNT" >> "$GITHUB_OUTPUT"
+        exit $EXIT
+
+    - name: Upload SARIF to GitHub Code Scanning
+      if: ${{ always() && inputs.upload-sarif == 'true' && steps.run.outputs.sarif-path != '' }}
+      uses: github/codeql-action/upload-sarif@dd903d2e4f5405488e5ef1422510ee31c8b32357 # v3.36.2
+      with:
+        sarif_file: ${{ steps.run.outputs.sarif-path }}
+        category: buggy
+
+    - name: Tear down local stack
+      if: ${{ always() && inputs.langgraph-url == '' }}
+      shell: bash
+      run: |
+        docker compose down -v --remove-orphans || true

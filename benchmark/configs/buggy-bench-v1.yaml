@@ -1,0 +1,34 @@
+name: buggy-bench-v1
+description: >
+  Buggy's opinionated multi-domain benchmark — 200 challenges
+  spanning web, AD, cloud, smart contracts, IoT firmware. Closes the
+  evaluation-credibility gap against comparable agents
+  winners by providing a Buggy-native scoring rubric the project
+  controls end-to-end.
+
+  v1 ships the scaffold; challenges are added in waves as their
+  generators / harness pieces land:
+
+    wave 1 (PR queue):  XBOW-style web challenges (40)
+    wave 2:             AD lab — TryHackMe-style Active Directory ranges (40)
+    wave 3:             AWS / GCP / Azure CTF-style enumeration paths (40)
+    wave 4:             Smart contract — DeFi reentrancy + flash-loan (40)
+    wave 5:             IoT firmware — extracted-firmware exploit tasks (40)
+
+provider: buggy-bench
+
+filters:
+  range: [0, 200]
+
+per_challenge_timeout_seconds: 1800
+
+model_profile: max
+
+assistant: buggy
+
+retain_artifacts:
+  - graph.json
+  - patches/
+  - report/
+  - .scratch/
+  - findings.sarif

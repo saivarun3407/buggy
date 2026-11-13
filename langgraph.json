@@ -1,0 +1,31 @@
+{
+  "dependencies": ["./packages/buggy"],
+  "graphs": {
+    "buggy": "./packages/buggy/buggy/agents/standard/buggy.py:graph",
+    "recon": "./packages/buggy/buggy/agents/standard/recon.py:graph",
+    "soundwave": "./packages/buggy/buggy/agents/standard/soundwave.py:graph",
+    "exploit": "./packages/buggy/buggy/agents/standard/exploit.py:graph",
+    "postexploit": "./packages/buggy/buggy/agents/standard/postexploit.py:graph",
+    "analyst": "./packages/buggy/buggy/agents/standard/analyst.py:graph",
+    "asvs_assessor": "./packages/buggy/buggy/agents/standard/asvs_assessor.py:graph",
+    "reverser": "./packages/buggy/buggy/agents/standard/reverser.py:graph",
+    "contract_auditor": "./packages/buggy/buggy/agents/standard/contract_auditor.py:graph",
+    "cloud_hunter": "./packages/buggy/buggy/agents/standard/cloud_hunter.py:graph",
+    "ad_operator": "./packages/buggy/buggy/agents/standard/ad_operator.py:graph",
+    "blue_cell": "./packages/buggy/buggy/agents/standard/blue_cell.py:graph",
+    "phisher": "./packages/buggy/buggy/agents/standard/phisher.py:graph",
+    "mobile_operator": "./packages/buggy/buggy/agents/standard/mobile_operator.py:graph",
+    "wireless_operator": "./packages/buggy/buggy/agents/standard/wireless_operator.py:graph",
+    "osint_operator": "./packages/buggy/buggy/agents/standard/osint_operator.py:graph",
+    "iot_operator": "./packages/buggy/buggy/agents/standard/iot_operator.py:graph",
+    "ics_operator": "./packages/buggy/buggy/agents/standard/ics_operator.py:graph",
+    "forensicator": "./packages/buggy/buggy/agents/standard/forensicator.py:graph",
+    "supply_chain_operator": "./packages/buggy/buggy/agents/standard/supply_chain_operator.py:graph"
+  },
+  "env": ".env",
+  "python_version": "3.13",
+  "http": {
+    "multitask_strategy": "interrupt",
+    "app": "./packages/buggy/buggy/server/plugins_api.py:app"
+  }
+}

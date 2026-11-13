@@ -1,0 +1,368 @@
+[project]
+name = "buggy-workspace"
+# Workspace umbrella — never published. Per-package versions are stamped
+# from the git tag at Docker build time. This root carries only the
+# shared tooling config (ruff/basedpyright/pytest/coverage) so the dev
+# workflow runs uniformly across the three published packages under
+# ``packages/``.
+version = "0.0.0"
+description = "Buggy monorepo workspace (core / framework / sdk split)"
+requires-python = ">=3.13"
+dependencies = [
+    "buggy",
+    "buggy-core",
+    "buggy-sdk",
+]
+
+[project.optional-dependencies]
+# Passthrough extras so ``uv sync --extra neo4j`` from the workspace
+# root activates the framework's neo4j driver. Without this, the extra
+# is invisible at root because uv treats extras as per-project.
+neo4j = ["buggy[neo4j]"]
+
+[tool.uv]
+# Virtual root — no wheel built from the workspace umbrella. Real
+# packages live under ``packages/*`` and are built per their own
+# ``[tool.hatch.build.targets.wheel]`` configs.
+package = false
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+buggy = { workspace = true }
+buggy-core = { workspace = true }
+buggy-sdk = { workspace = true }
+
+# Project-level plugin activation, read by ``buggy.plugin_loader``
+# from the CWD's pyproject.toml. Kept at the workspace root so the
+# in-checkout dev workflow (``make dev``, ``langgraph dev``,
+# ``make benchmark``) automatically activates the OSS bundles plus this
+# fork's ``bounty`` slate without forcing every contributor to remember
+# the env var.
+# OSS end-user installs that don't clone this repo fall back to the
+# hardcoded ``["standard"]`` default; downstream Docker images override via
+# ``ENV BUGGY_PLUGINS=standard,vendor``.
+#
+# ``bounty`` is this fork's appsec / bug-bounty specialist slate. It is a
+# separate opt-in bundle (and deliberately kept out of langgraph.json /
+# STANDARD_GRAPHS) so the ``standard`` bundle can still track upstream
+# cleanly. Override at runtime with ``BUGGY_PLUGINS``.
+
+[tool.buggy.plugins]
+enabled = ["standard", "plugins", "bounty"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.0.0",
+    "pytest-xdist>=3.6.0",
+    "ruff>=0.4.0",
+    "basedpyright>=1.37.0",
+]
+lint = [
+    "bandit[toml]>=1.7.10",
+    "deptry>=0.20.0",
+    "vulture>=2.13",
+    "refurb>=2.0.0",
+    "radon>=6.0.1",
+    "xenon>=0.9.1",
+    "mypy>=1.13.0",
+    "yamllint>=1.35.1",
+]
+
+# ─────────────────────────────────────────────────────────────────────
+# Shared tooling — workspace-wide. Per-package overrides intentionally
+# absent: the three packages share a single Ruff + basedpyright +
+# pytest contract so contributors don't have to remember per-package
+# variations.
+# ─────────────────────────────────────────────────────────────────────
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+extend-exclude = [
+    "benchmark/xbow-validation-benchmarks",
+    "benchmark/MHBench",
+    "benchmark/results",
+    "integrations/reverse-skill",
+]
+
+[tool.ruff.lint]
+# TID251 = flake8-tidy-imports banned-api. Enables the
+# buggy-core langchain-free guarantee at lint time
+# (complements the runtime test_no_runtime_deps subprocess check).
+select = ["E", "F", "I", "W", "TID251"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+# Mark all three workspace packages as first-party so isort groups
+# them together instead of treating ``buggy_core`` /
+# ``buggy_sdk`` as third-party.
+known-first-party = ["buggy", "buggy_core", "buggy_sdk"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+# Spec §11.4: ``buggy-core`` must never import these. The
+# per-file-ignores section below scopes the rule to the core layer
+# only — the framework + SDK packages legitimately use them.
+"langchain".msg = "buggy-core must stay langchain-free (spec §11.4)"
+"langchain_core".msg = "buggy-core must stay langchain-free (spec §11.4)"
+"langchain_anthropic".msg = "buggy-core must stay langchain-free (spec §11.4)"
+"langchain_openai".msg = "buggy-core must stay langchain-free (spec §11.4)"
+"langgraph".msg = "buggy-core must stay langchain-free (spec §11.4)"
+"deepagents".msg = "buggy-core must stay langchain-free (spec §11.4)"
+"httpx".msg = "buggy-core must stay langchain-free (spec §11.4)"
+"fastapi".msg = "buggy-core must stay langchain-free (spec §11.4)"
+"uvicorn".msg = "buggy-core must stay langchain-free (spec §11.4)"
+
+[tool.ruff.lint.per-file-ignores]
+# Scope banned-api to buggy-core: the framework, SDK, LiteLLM
+# config handlers, benchmark harness, and clients legitimately depend
+# on langchain / langgraph / deepagents / httpx / fastapi.
+"packages/buggy/**" = ["TID251"]
+"packages/buggy-sdk/**" = ["TID251"]
+"benchmark/**" = ["TID251"]
+"clients/**" = ["TID251"]
+"scripts/**" = ["TID251"]
+"config/**" = ["TID251"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+# Explicit sys.path entries (rootdir-relative) so test collection
+# resolves the three workspace packages from their src trees plus the
+# repo-root ``benchmark`` package — independent of whether the editable
+# install's .pth is active in the pytest process. CI's fresh runner
+# env doesn't reliably surface uv's editable finder to the pytest
+# subprocess, so this is the deterministic path.
+pythonpath = [
+    ".",
+    "packages/buggy-core",
+    "packages/buggy",
+    "packages/buggy-sdk",
+]
+testpaths = [
+    "packages/buggy-core/tests",
+    "packages/buggy/tests",
+    "packages/buggy-sdk/tests",
+]
+markers = [
+    "asyncio: mark test as async (pytest-asyncio)",
+    "slow: integration-style tests that hit wall-clock timeouts or otherwise take seconds; deselected from the PR fast lane",
+]
+addopts = [
+    "--strict-markers",
+    "--strict-config",
+    "-ra",
+]
+
+[tool.coverage.run]
+source = ["packages/buggy/buggy"]
+branch = true
+omit = [
+    "packages/buggy/buggy/__main__.py",
+    "packages/buggy/buggy/auth/providers/*",
+]
+
+[tool.coverage.html]
+directory = "htmlcov"
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+    "\\.\\.\\.",
+]
+show_missing = true
+skip_covered = false
+
+[tool.basedpyright]
+pythonVersion = "3.13"
+include = [
+    "packages/buggy-core",
+    "packages/buggy-core/tests",
+    "packages/buggy",
+    "packages/buggy/tests",
+    "packages/buggy-sdk",
+    "packages/buggy-sdk/tests",
+    "benchmark",
+]
+exclude = [
+    "**/__pycache__",
+    "**/node_modules",
+    "reference",
+    "packages/buggy/buggy/auth/providers",
+    "benchmark/xbow-validation-benchmarks",
+    "benchmark/MHBench",
+    "benchmark/results",
+]
+# Use pyright "standard" semantics rather than the basedpyright "all" default —
+# the existing codebase predates basedpyright's stricter rules. As code is
+# annotated over time, individual reports can be ratcheted back to "error".
+typeCheckingMode = "standard"
+reportMissingImports = "warning"
+reportMissingTypeStubs = "none"
+# Unknown types — common with langchain/langgraph dynamic interfaces
+reportUnknownMemberType = "none"
+reportUnknownArgumentType = "none"
+reportUnknownVariableType = "none"
+reportUnknownParameterType = "none"
+reportUnknownLambdaType = "none"
+reportMissingTypeArgument = "none"
+# basedpyright extras that fire on idiomatic Python
+reportAny = "none"
+reportExplicitAny = "none"
+reportImplicitOverride = "none"
+reportUnusedCallResult = "none"
+reportUnannotatedClassAttribute = "none"
+reportUninitializedInstanceVariable = "none"
+reportImplicitStringConcatenation = "none"
+reportPrivateUsage = "none"
+reportImportCycles = "none"
+reportPropertyTypeMismatch = "none"
+reportIgnoreCommentWithoutRule = "none"
+# Demote pre-existing issues to warnings (still surfaced, but non-blocking).
+# Real attribute-access bugs in newly-written code should still be caught:
+# add a # pyright: ignore[reportAttributeAccessIssue] comment at the call site
+# instead of escalating this back to "error" wholesale.
+reportAttributeAccessIssue = "warning"
+reportOperatorIssue = "warning"
+reportArgumentType = "warning"
+reportCallIssue = "warning"
+reportAssignmentType = "warning"
+reportReturnType = "warning"
+reportGeneralTypeIssues = "warning"
+# Phase 5 added ``py.typed`` markers to all three packages, which
+# flips pyright into strict re-export checking — re-exported imports
+# without an explicit ``__all__`` count as private. The existing
+# framework codebase predates this convention; demote to warning so
+# the migration list surfaces over time without blocking new work.
+reportPrivateImportUsage = "warning"
+
+[tool.bandit]
+exclude_dirs = [
+    "tests",
+    "benchmark/xbow-validation-benchmarks",
+    "benchmark/MHBench",
+    "node_modules",
+    ".venv",
+]
+skips = ["B101", "B404", "B603"]
+
+[tool.mypy]
+python_version = "3.13"
+files = [
+    "packages/buggy-core/buggy_core",
+    "packages/buggy/buggy",
+    "packages/buggy-sdk/buggy_sdk",
+]
+exclude = [
+    "tests/",
+    "benchmark/xbow-validation-benchmarks",
+    "benchmark/MHBench",
+    "node_modules",
+    ".venv",
+]
+ignore_missing_imports = true
+follow_imports = "silent"
+check_untyped_defs = true
+warn_unused_ignores = false
+warn_redundant_casts = true
+warn_unreachable = false
+no_implicit_optional = true
+strict_equality = true
+show_error_codes = true
+show_column_numbers = true
+disable_error_code = [
+    "import-untyped",
+    "no-untyped-call",
+    "var-annotated",
+    "type-arg",
+    "assignment",
+    "arg-type",
+    "return-value",
+    "call-arg",
+    "attr-defined",
+    "operator",
+    "union-attr",
+    "index",
+    "no-redef",
+    "valid-type",
+    "misc",
+    "func-returns-value",
+    "unused-coroutine",
+    "type-var",
+    "override",
+    "call-overload",
+    "name-defined",
+    "abstract",
+    "list-item",
+    "return",
+    "dict-item",
+    "annotation-unchecked",
+]
+
+[tool.refurb]
+ignore = [
+    "FURB101",
+    "FURB103",
+    "FURB113",
+    "FURB118",
+    "FURB129",
+    "FURB144",
+    "FURB148",
+    "FURB152",
+    "FURB154",
+]
+
+[tool.vulture]
+paths = [
+    "packages/buggy-core/buggy_core",
+    "packages/buggy/buggy",
+    "packages/buggy-sdk/buggy_sdk",
+]
+exclude = [
+    "tests/",
+    "benchmark/xbow-validation-benchmarks",
+    "benchmark/MHBench",
+    ".venv/",
+    "node_modules/",
+]
+min_confidence = 80
+ignore_decorators = [
+    "@app.route",
+    "@router.*",
+    "@*.command",
+    "@pytest.fixture",
+    "@tool",
+    "@plugin",
+    "@cached_property",
+]
+ignore_names = [
+    "graph",
+    "SUBAGENT_SPEC",
+    "_*",
+    "test_*",
+    "Test*",
+    "Meta",
+    "Config",
+    "model_*",
+]
+
+[tool.deptry]
+extend_exclude = [
+    "tests",
+    "benchmark/xbow-validation-benchmarks",
+    "benchmark/MHBench",
+    "scripts",
+    ".venv",
+    "node_modules",
+]
+ignore = [
+    "DEP002",
+    "DEP004",
+    "DEP003",
+    "DEP001",
+]

@@ -1,0 +1,38 @@
+{
+  "name": "@buggy/cli",
+  "version": "0.0.0",
+  "description": "Buggy Ink CLI — terminal interface for LangGraph Platform agents",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "buggy-ink": "dist/index.js"
+  },
+  "scripts": {
+    "start": "node dist/index.js",
+    "dev": "tsc --watch",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@buggy/streaming": "*",
+    "@inkjs/ui": "^2.0.0",
+    "@langchain/langgraph-sdk": "^1.8.8",
+    "@types/diff": "^8.0.0",
+    "diff": "^8.0.4",
+    "ink": "^6.0.0",
+    "marked": "^15.0.12",
+    "marked-terminal": "^7.3.0",
+    "react": "^19.0.0"
+  },
+  "devDependencies": {
+    "@testing-library/react": "^16.3.2",
+    "@types/node": "^25.5.0",
+    "@types/react": "^19.0.0",
+    "jsdom": "^29.1.1",
+    "react-dom": "^19.2.4",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.8"
+  }
+}

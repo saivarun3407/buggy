@@ -1,0 +1,231 @@
+[project]
+name = "buggy"
+# Sentinel — replaced with the git tag at Docker build time via ARG VERSION
+# in containers/langgraph.Dockerfile. Source-tree value is intentionally
+# stable (not bumped per release) so contributors never need a manual
+# version commit before tagging.
+version = "0.0.0"
+description = "AI-powered autonomous red team testing framework"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.13"
+
+authors = [
+    { name = "Buggy Team" }
+]
+
+keywords = [
+    "ai", "security", "red-team", "penetration-testing",
+    "llm", "langchain", "langgraph", "autonomous-agents"
+]
+
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    # Contract layer (split out in Phase 1 of the core/framework/sdk
+    # redesign — see docs/superpowers/specs/2026-05-23-core-framework-sdk-split-design.md).
+    # Workspace-resolved to the in-tree packages/buggy-core/ during
+    # dev; pinned to the same version as buggy at release time.
+    "buggy-core",
+    # Core
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "pyyaml>=6.0.0",
+    "python-dotenv>=1.0.0",
+    # LLM
+    "langchain-core>=0.3.0",
+    "langchain-openai>=0.3.0",
+    "langchain-anthropic>=0.3.0",
+    "langgraph>=1.0.0",
+    # CVE-2026-115885 (GHSA-8prr-f582-jqq3): verbose CLI logged arbitrary stdin.
+    "langgraph-cli[inmem]>=0.4.37",
+    # CVE-2026-118668 (GHSA-4hm6-w6qq-w73v): Store authorization namespace floor.
+    "langgraph-api>=0.15.0,<1",
+    # CVE-2026-119194..119197: pyasn1 decoder fixes (container/string/bit string/REAL).
+    "pyasn1>=0.6.5",
+    "langgraph-sdk>=0.1.0",
+    # HTTP
+    "httpx>=0.27.0",
+    # Floor raised 0.5.0 -> 0.6.8 (the version the upstream ddann lock already
+    # resolves to, and the API surface this code targets: backends.protocol,
+    # CompiledSubAgent, patch_tool_calls, middleware._utils). 0.6.x also made
+    # SubAgentMiddleware reject an empty subagent list — _make_subagent guards
+    # for that. Keeps resolution from drifting DOWN to a pre-0.6 contract.
+    "deepagents>=0.6.8",
+    # Open-web engine (buggy/sandbox_web) — runs inside the sandbox, which
+    # mounts buggy as /deps/buggy, so its pure-Python parse deps ride
+    # the main install set (same rationale as the FastAPI/uvicorn note below).
+    # The network tier (curl_cffi) is heavier and stays sandbox-image-only; unit
+    # tests mock it. beautifulsoup4 backs the validator's success_selector proof.
+    "beautifulsoup4>=4.12.0",
+    # Sandbox HTTP daemon — the FastAPI app that ships inside the
+    # sandbox container and that `HTTPSandbox` (buggy/backends/
+    # http_sandbox.py) talks to. Carried in the main install set
+    # because the sandbox container mounts buggy as
+    # /deps/buggy and runs `python -m buggy.sandbox_server`
+    # as its entrypoint; the agent process imports nothing from these
+    # at runtime.
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+    # CLI
+    "typer[all]>=0.9.0",
+    "xxhash>=3.0.0",
+    # Security
+    "defusedxml>=0.7.0",
+    # Transitive-dependency security floors (pip-audit gate). Not imported
+    # directly — pinned up to clear advisories the resolver would otherwise
+    # leave on older versions:
+    #   click        — PYSEC-2026-2132 (fixed 8.3.3)
+    #   cryptography — GHSA-537c-gmf6-5ccf / PYSEC-2026-3552 (fixed 50.0.0)
+    #   starlette    — CVE-2026-48818 / -48817 / -54283 / -54282 (fixed ≤1.3.1)
+    #   langchain    — GHSA-gr75-jv2w-4656 (fixed 1.3.9); floor raised to 1.4.7
+    #   certifi      — PYSEC-2026-4320 (fixed 2026.10.19)
+    "click>=8.3.3",
+    "cryptography>=50.0.0",
+    "starlette>=1.3.1",
+    "langchain>=1.4.7,<2",
+    "certifi>=2026.10.19",
+]
+
+[project.optional-dependencies]
+# Heavy / feature-specific deps kept out of the base install so
+# `pip install buggy` stays lean for library consumers. The neo4j
+# driver is imported lazily inside ``KGStore.__init__``
+# (buggy/middleware/kg_internal/store.py), so the base install
+# imports and runs everything except the KG graph tools.
+neo4j = ["neo4j>=6,<7"]
+# Buggy fork: the `telemetry` extra (opentelemetry OTLP exporters) is removed.
+# Telemetry / phone-home is permanently disabled, so there is no optional
+# network-exporter install. `buggy/telemetry/otel.py` is a hard no-op.
+# MCP server — exposes Buggy engagement control over the Model
+# Context Protocol so external agents (OpenClaw, Hermes, or any MCP
+# client) can drive engagements. Provides the ``buggy-mcp`` script.
+# pyjwt[crypto] backs the JWT (OAuth 2.1 resource-server) auth mode on the
+# streamable-http transport; shared-secret + stdio modes never import it.
+mcp = ["mcp>=1.9.0", "pyjwt[crypto]>=2.10"]
+all = ["buggy[neo4j,mcp]"]
+
+[project.scripts]
+buggy-cli = "buggy.cli.__main__:main"
+buggy-kg-health = "buggy.tools.research.health:main"
+buggy-mcp = "buggy.mcp_server.__main__:main"
+
+# Plugin entry-point groups consumed by ``buggy.plugin_loader``.
+# External packages (downstream or community plugins) declare their
+# contributions under these groups. See ``buggy/plugin_loader.py``
+# for the loader contract (shapes, factory kwargs, error isolation).
+#
+#   [project.entry-points."buggy.tools"]
+#   my-tools = "my_pkg.tools:get_tools"
+#
+#   [project.entry-points."buggy.middleware"]
+#   my-mw = "my_pkg.middleware:get_middleware"
+#
+#   [project.entry-points."buggy.agents"]
+#   my-agent = "my_pkg.agents.my_agent"
+#
+#   [project.entry-points."buggy.subagents"]
+#   my-subagent = "my_pkg.agents.my_subagent:SUBAGENT_SPEC"
+#
+#   [project.entry-points."buggy.callbacks"]
+#   my-cb = "my_pkg.callbacks:get_callbacks"
+
+# OSS-shipped subagents — registered here so the plugin loader picks
+# them up uniformly with external plugins. Each entry resolves to a
+# ``SubAgentSpec`` module constant declaring (name, description,
+# factory, parent_agents, bundle, priority). The main agents iterate
+# ``load_subagents_for_parent(<their-name>)`` at construction time;
+# adding a new subagent — OSS or plugin — is a pure entry-point
+# registration with no main-agent edits required.
+#
+# Bundle activation — controlled by a 4-tier hierarchy (highest wins):
+#   1. BUGGY_PLUGINS env var (e.g. "standard,plugins,vendor" or "*")
+#   2. .buggy.toml: [plugins] enabled = [...]
+#   3. pyproject.toml: [tool.buggy.plugins] enabled = [...]
+#   4. Default: ["standard"]
+# Default keeps OSS lean. The ``plugins`` bundle (vulnresearch family)
+# is opt-in. See buggy/plugin_loader.py for the loader contract.
+
+# Default Buggy project config — kept in OSS so this checkout's
+# native dev workflow (e.g. ``make benchmark``, ``langgraph dev``)
+# automatically activates both bundles instead of forcing every
+# developer to remember the env var. End-user OSS installs that DON'T
+# clone this repo see the hardcoded ``["standard"]`` default; downstream
+# images override via ``ENV BUGGY_PLUGINS=standard,vendor``.
+
+[tool.buggy.plugins]
+# ``bounty`` is the fork-only appsec / bug-bounty specialist slate. It is
+# kept as its own opt-in bundle (and out of langgraph.json / STANDARD_GRAPHS)
+# so the ``standard`` bundle can still track upstream cleanly; this fork
+# ships it enabled. Override at runtime with BUGGY_PLUGINS.
+enabled = ["standard", "plugins", "bounty"]
+
+[project.entry-points."buggy.subagents"]
+# Standard bundle — attached to the ``buggy`` main agent.
+recon = "buggy.agents.standard.recon:SUBAGENT_SPEC"
+exploit = "buggy.agents.standard.exploit:SUBAGENT_SPEC"
+analyst = "buggy.agents.standard.analyst:SUBAGENT_SPEC"
+asvs_assessor = "buggy.agents.standard.asvs_assessor:SUBAGENT_SPEC"
+reverser = "buggy.agents.standard.reverser:SUBAGENT_SPEC"
+contract_auditor = "buggy.agents.standard.contract_auditor:SUBAGENT_SPEC"
+cloud_hunter = "buggy.agents.standard.cloud_hunter:SUBAGENT_SPEC"
+ad_operator = "buggy.agents.standard.ad_operator:SUBAGENT_SPEC"
+postexploit = "buggy.agents.standard.postexploit:SUBAGENT_SPEC"
+phisher = "buggy.agents.standard.phisher:SUBAGENT_SPEC"
+mobile_operator = "buggy.agents.standard.mobile_operator:SUBAGENT_SPEC"
+wireless_operator = "buggy.agents.standard.wireless_operator:SUBAGENT_SPEC"
+blue_cell = "buggy.agents.standard.blue_cell:SUBAGENT_SPEC"
+osint_operator = "buggy.agents.standard.osint_operator:SUBAGENT_SPEC"
+iot_operator = "buggy.agents.standard.iot_operator:SUBAGENT_SPEC"
+ics_operator = "buggy.agents.standard.ics_operator:SUBAGENT_SPEC"
+forensicator = "buggy.agents.standard.forensicator:SUBAGENT_SPEC"
+supply_chain_operator = "buggy.agents.standard.supply_chain_operator:SUBAGENT_SPEC"
+# Plugins bundle — vulnresearch family, attached to the ``vulnresearch`` main agent.
+scanner = "buggy.agents.plugins.scanner:SUBAGENT_SPEC"
+detector = "buggy.agents.plugins.detector:SUBAGENT_SPEC"
+verifier = "buggy.agents.plugins.verifier:SUBAGENT_SPEC"
+patcher = "buggy.agents.plugins.patcher:SUBAGENT_SPEC"
+exploiter = "buggy.agents.plugins.exploiter:SUBAGENT_SPEC"
+# Bounty bundle (fork-only) — appsec / bug-bounty slate, attached to the
+# ``buggy`` main agent. Kept out of langgraph.json so the standard
+# bundle stays upstream-syncable; opt-in via [tool.buggy.plugins].
+# ``scout`` is the intake agent (program selection → enforced scope).
+scout = "buggy.agents.bounty.scout:SUBAGENT_SPEC"
+asvs = "buggy.agents.bounty.asvs:SUBAGENT_SPEC"
+mitre_attack = "buggy.agents.bounty.mitre_attack:SUBAGENT_SPEC"
+api_security = "buggy.agents.bounty.api_security:SUBAGENT_SPEC"
+authn_session = "buggy.agents.bounty.authn_session:SUBAGENT_SPEC"
+business_logic = "buggy.agents.bounty.business_logic:SUBAGENT_SPEC"
+graphql_security = "buggy.agents.bounty.graphql_security:SUBAGENT_SPEC"
+ssrf_cloud = "buggy.agents.bounty.ssrf_cloud:SUBAGENT_SPEC"
+clientside_security = "buggy.agents.bounty.clientside_security:SUBAGENT_SPEC"
+llm_security = "buggy.agents.bounty.llm_security:SUBAGENT_SPEC"
+secrets_cicd = "buggy.agents.bounty.secrets_cicd:SUBAGENT_SPEC"
+
+[project.urls]
+Homepage = "https://github.com/saivarun3407/buggy"
+Repository = "https://github.com/saivarun3407/buggy"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# Source under src/ — PEP 517 src-layout so editable installs don't
+# accidentally import from the workspace root during dev.
+packages = ["buggy"]
+# Skill markdown trees (standard/shared/plugins) ship as package data and are
+# included by default since they are VCS-tracked. Benchmark skills are
+# XBOW/CTF eval-harness conventions — kept in-repo for `make benchmark` but
+# excluded from the published wheel.
+exclude = ["buggy/skills/benchmark/**"]

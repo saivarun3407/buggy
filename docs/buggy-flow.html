@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Buggy — Workflow &amp; Data Flow</title>
+<style>
+  body { margin: 0; padding: 22px; background: #0d1117; font-family: Menlo, Consolas, monospace; }
+  svg { display: block; margin: 0 auto; max-width: 100%; height: auto; }
+</style>
+</head>
+<body>
+<svg width="1780" height="1010" viewBox="0 0 1780 1010" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ah"  markerWidth="9" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#8b949e"/></marker>
+    <marker id="ahR" markerWidth="9" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#ff7b72"/></marker>
+    <marker id="ahG" markerWidth="9" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#7ee787"/></marker>
+    <marker id="ahK" markerWidth="9" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#f778ba"/></marker>
+    <marker id="ahD" markerWidth="9" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#ffa657"/></marker>
+    <style>
+      .zone  { fill: #ffffff03; stroke: #30363d; stroke-dasharray: 6 5; }
+      .zlab  { fill: #6e7681; font-size: 10.5px; letter-spacing: 2px; }
+      .node  { fill: #0d1117; stroke-width: 1.4; }
+      .nt    { fill: #e6edf3; font-size: 12px; font-weight: 600; }
+      .nd    { fill: #8b949e; font-size: 10px; }
+      .edge  { fill: none; stroke: #8b949e; stroke-width: 1.4; marker-end: url(#ah); }
+      .edgeR { fill: none; stroke: #ff7b72; stroke-width: 1.4; marker-end: url(#ahR); }
+      .edgeG { fill: none; stroke: #7ee787; stroke-width: 1.4; marker-end: url(#ahG); }
+      .edgeK { fill: none; stroke: #f778ba; stroke-width: 1.4; stroke-dasharray: 5 4; marker-end: url(#ahK); }
+      .edgeD { fill: none; stroke: #ffa657; stroke-width: 1.4; stroke-dasharray: 5 4; marker-end: url(#ahD); }
+      .stub  { fill: none; stroke: #8b949e; stroke-width: 1.4; }
+      .elab  { fill: #c9d1d9; font-size: 10px; }
+      .eR    { fill: #ffb4ae; font-size: 10px; }
+      .eG    { fill: #a9e6ae; font-size: 10px; }
+      .eK    { fill: #f3a6cd; font-size: 10px; }
+      .eD    { fill: #ffd9ae; font-size: 10px; }
+      .seq   { fill: #58a6ff; font-size: 13px; font-weight: 700; }
+      .title { fill: #e6edf3; font-size: 19px; font-weight: 700; }
+      .sub   { fill: #8b949e; font-size: 11px; }
+      .sE { stroke: #58a6ff; } .sO { stroke: #d2a8ff; } .sA { stroke: #56d4dd; }
+      .sT { stroke: #7ee787; } .sG { stroke: #ff7b72; } .sK { stroke: #f778ba; }
+      .sW { stroke: #ffa657; } .sD { stroke: #8b949e; }
+    </style>
+  </defs>
+
+  <text class="title" x="20" y="30">Buggy — Workflow &amp; Data Flow</text>
+  <text class="sub" x="20" y="50">①–⑥ engagement lifecycle · dashed pink/orange = data + side channels · red = enforcement · green = verified findings</text>
+
+  <!-- ══ ZONES ══ -->
+  <rect class="zone" x="250" y="70" width="270" height="560" rx="12"/>
+  <text class="zlab" x="265" y="92">PLAN — before anything fires</text>
+  <rect class="zone" x="560" y="70" width="300" height="560" rx="12"/>
+  <text class="zlab" x="575" y="92">ORCHESTRATE — LangGraph</text>
+  <rect class="zone" x="900" y="70" width="260" height="560" rx="12"/>
+  <text class="zlab" x="915" y="92">ENFORCE — every dispatch</text>
+  <rect class="zone" x="1200" y="70" width="300" height="560" rx="12"/>
+  <text class="zlab" x="1215" y="92">EXECUTE — fresh context each</text>
+  <rect class="zone" x="250" y="670" width="1520" height="320" rx="12"/>
+  <text class="zlab" x="265" y="692">DATA PLANE — stores · models · side lanes</text>
+
+  <!-- ══ COLUMN 1: OPERATOR ══ -->
+  <rect class="node sE" x="30" y="90" width="180" height="52" rx="8"/>
+  <text class="nt" x="46" y="112">Operator</text>
+  <text class="nd" x="46" y="128">authorizes + receives report</text>
+  <rect class="node sE" x="30" y="200" width="180" height="52" rx="8"/>
+  <text class="nt" x="46" y="222">buggy-cli engage</text>
+  <text class="nd" x="46" y="238">target+scope → plan bundle</text>
+  <rect class="node sW" x="30" y="430" width="180" height="60" rx="8"/>
+  <text class="nt" x="46" y="452">benchmark/harness.py</text>
+  <text class="nd" x="46" y="468">XBOW containers, flag</text>
+  <text class="nd" x="46" y="482">scoring — BENCHMARK_MODE</text>
+
+  <!-- ══ PLAN ══ -->
+  <rect class="node sO" x="285" y="105" width="200" height="58" rx="8"/>
+  <text class="nt" x="301" y="127">Soundwave</text>
+  <text class="nd" x="301" y="143">standalone graph — interviews</text>
+  <text class="nd" x="301" y="156">operator, drafts the bundle</text>
+  <rect class="node sK" x="285" y="200" width="200" height="58" rx="8"/>
+  <text class="nt" x="301" y="222">plan/roe.json + 7 docs</text>
+  <text class="nd" x="301" y="238">RoE · Threat Profile · CONOPS ·</text>
+  <text class="nd" x="301" y="251">Deconfliction · Abort · Cleanup…</text>
+  <rect class="node sO" x="285" y="295" width="200" height="52" rx="8"/>
+  <text class="nt" x="301" y="317">OPPLAN</text>
+  <text class="nd" x="301" y="333">ordered objective list</text>
+  <rect class="node sG" x="285" y="385" width="200" height="58" rx="8"/>
+  <text class="nt" x="301" y="407">startup approval</text>
+  <text class="nd" x="301" y="423">operator signs the engagement —</text>
+  <text class="nd" x="301" y="436">nothing fires before this</text>
+  <rect class="node sD" x="285" y="480" width="200" height="58" rx="8"/>
+  <text class="nt" x="301" y="502">RoE defaults</text>
+  <text class="nd" x="301" y="518">no policy → audit-only mode;</text>
+  <text class="nd" x="301" y="531">ROE_REQUIRE=1 → fail closed</text>
+
+  <!-- ══ ORCHESTRATE ══ -->
+  <rect class="node sO" x="600" y="110" width="220" height="66" rx="8"/>
+  <text class="nt" x="616" y="132">Buggy</text>
+  <text class="nd" x="616" y="148">red-team orchestrator — reads</text>
+  <text class="nd" x="616" y="161">OPPLAN, dispatches task(),</text>
+  <text class="nd" x="616" y="174">tracks PASS / BLOCKED</text>
+  <rect class="node sO" x="600" y="215" width="220" height="60" rx="8"/>
+  <text class="nt" x="616" y="237">Vulnresearch</text>
+  <text class="nd" x="616" y="253">5-stage pipeline — stage state</text>
+  <text class="nd" x="616" y="266">moves ONLY through the KG</text>
+  <rect class="node sO" x="600" y="315" width="220" height="60" rx="8"/>
+  <text class="nt" x="616" y="337">blue_cell</text>
+  <text class="nd" x="616" y="353">defense agent — Offensive</text>
+  <text class="nd" x="616" y="366">Vaccine: attack path → detection</text>
+  <rect class="node sO" x="600" y="384" width="220" height="50" rx="8"/>
+  <text class="nt" x="616" y="405">persistence policy</text>
+  <text class="nd" x="616" y="420">SURFACE_COUNTS gates effort — rich:</text>
+  <text class="nd" x="616" y="432">follow-up objectives; thin: converge</text>
+  <rect class="node sW" x="600" y="440" width="220" height="70" rx="8"/>
+  <text class="nt" x="616" y="462">middleware slots</text>
+  <text class="nd" x="616" y="478">wraps every model+tool call —</text>
+  <text class="nd" x="616" y="491">safety slots locked unless</text>
+  <text class="nd" x="616" y="504">SAFETY_OVERRIDES=1</text>
+
+  <!-- ══ ENFORCE ══ -->
+  <rect class="node sG" x="930" y="105" width="200" height="62" rx="8"/>
+  <text class="nt" x="946" y="127">RoE guardrail</text>
+  <text class="nd" x="946" y="143">extracts target per call —</text>
+  <text class="nd" x="946" y="156">scope / forbidden / windows</text>
+  <rect class="node sG" x="930" y="205" width="200" height="52" rx="8"/>
+  <text class="nt" x="946" y="227">HITL gate</text>
+  <text class="nd" x="946" y="243">opt-in — high-impact actions</text>
+  <rect class="node sG" x="930" y="295" width="200" height="56" rx="8"/>
+  <text class="nt" x="946" y="317">egress allowlist</text>
+  <text class="nd" x="946" y="333">sandbox nftables — the real</text>
+  <text class="nd" x="946" y="346">network boundary</text>
+  <rect class="node sG" x="930" y="395" width="200" height="56" rx="8"/>
+  <text class="nt" x="946" y="417">audit ledger</text>
+  <text class="nd" x="946" y="433">HMAC-chained →</text>
+  <text class="nd" x="946" y="446">audit/roe-decisions.jsonl</text>
+  <rect class="node sG" x="930" y="495" width="200" height="60" rx="8"/>
+  <text class="nt" x="946" y="517">untrusted-output shield</text>
+  <text class="nd" x="946" y="533">quarantines tool output —</text>
+  <text class="nd" x="946" y="546">injection can't re-author agent</text>
+
+  <!-- ══ EXECUTE ══ -->
+  <rect class="node sA" x="1230" y="100" width="240" height="48" rx="8"/>
+  <text class="nt" x="1246" y="121">recon  (dispatched FIRST)</text>
+  <text class="nd" x="1246" y="137">ports · services · OSINT → KG</text>
+  <rect class="node sA" x="1230" y="170" width="240" height="52" rx="8"/>
+  <text class="nt" x="1246" y="191">exploit</text>
+  <text class="nd" x="1246" y="207">initial access — holds</text>
+  <text class="nd" x="1246" y="219">RECONCILIATION_TOOLS</text>
+  <rect class="node sA" x="1230" y="244" width="240" height="44" rx="8"/>
+  <text class="nt" x="1246" y="264">postexploit</text>
+  <text class="nd" x="1246" y="279">priv-esc · lateral · C2</text>
+  <rect class="node sA" x="1230" y="310" width="240" height="52" rx="8"/>
+  <text class="nt" x="1246" y="331">domain operators</text>
+  <text class="nd" x="1246" y="347">ad · cloud · contract · phisher ·</text>
+  <text class="nd" x="1246" y="359">mobile · wireless · ics …</text>
+  <rect class="node sA" x="1230" y="384" width="240" height="52" rx="8"/>
+  <text class="nt" x="1246" y="405">vulnresearch pipeline</text>
+  <text class="nd" x="1246" y="421">scan→detect→verify⚔→patch→exploit</text>
+  <text class="nd" x="1246" y="433">verifier is adversarial: kill the claim</text>
+  <rect class="node sK" x="1230" y="470" width="240" height="56" rx="8"/>
+  <text class="nt" x="1246" y="492">🎯 in-scope target</text>
+  <text class="nd" x="1246" y="508">only reachable inside the</text>
+  <text class="nd" x="1246" y="521">egress allowlist</text>
+
+  <!-- ══ DATA PLANE — row A y705, row B y800 ══ -->
+  <rect class="node sK" x="285" y="705" width="220" height="62" rx="8"/>
+  <text class="nt" x="301" y="727">LiteLLM gateway</text>
+  <text class="nd" x="301" y="743">subscription probe → fallback</text>
+  <text class="nd" x="301" y="756">chain → refusal circuit → logged</text>
+  <rect class="node sD" x="285" y="800" width="220" height="56" rx="8"/>
+  <text class="nt" x="301" y="822">providers</text>
+  <text class="nd" x="301" y="838">Kimi·GLM·Claude·OpenAI·Grok·</text>
+  <text class="nd" x="301" y="851">Fable·Gemini</text>
+
+  <rect class="node sW" x="560" y="705" width="240" height="62" rx="8"/>
+  <text class="nt" x="576" y="727">SARIF (semgrep/bandit)</text>
+  <text class="nd" x="576" y="743">→ reconcile_sast_to_queue</text>
+  <text class="nd" x="576" y="756">→ finding_template (file:line:cwe)</text>
+  <rect class="node sK" x="560" y="800" width="240" height="62" rx="8"/>
+  <text class="nt" x="576" y="822">Neo4j knowledge graph</text>
+  <text class="nd" x="576" y="838">Finding·Host·Vuln·Technique·Path ·</text>
+  <text class="nd" x="576" y="851">canonical-key dedup on write</text>
+
+  <rect class="node sK" x="890" y="705" width="220" height="62" rx="8"/>
+  <text class="nt" x="906" y="727">workspace/</text>
+  <text class="nd" x="906" y="743">FIND-*.md + PoC + OPPLAN +</text>
+  <text class="nd" x="906" y="756">audit/roe-decisions.jsonl</text>
+  <rect class="node sG" x="890" y="800" width="220" height="62" rx="8"/>
+  <text class="nt" x="906" y="822">proof gate</text>
+  <text class="nd" x="906" y="838">live-evidence re-verify via Caido —</text>
+  <text class="nd" x="906" y="851">mints Replay-tab artifacts (FINDING_REPLAY)</text>
+
+  <rect class="node sT" x="1140" y="705" width="220" height="62" rx="8"/>
+  <text class="nt" x="1156" y="727">kg_recorder</text>
+  <text class="nd" x="1156" y="743">benchmark outcome → Neo4j</text>
+  <text class="nd" x="1156" y="756">(off event loop — to_thread)</text>
+  <rect class="node sW" x="1140" y="800" width="220" height="62" rx="8"/>
+  <text class="nt" x="1156" y="822">Devin session  ⚠</text>
+  <text class="nd" x="1156" y="838">OUTSIDE envelope — no RoE,</text>
+  <text class="nd" x="1156" y="851">egress, proof gate, or audit</text>
+
+  <rect class="node sE" x="1420" y="705" width="220" height="62" rx="8"/>
+  <text class="nt" x="1436" y="727">report + re-verification</text>
+  <text class="nd" x="1436" y="743">findings · reproduction ·</text>
+  <text class="nd" x="1436" y="756">remediation · fix retest</text>
+  <rect class="node sK" x="1420" y="800" width="220" height="62" rx="8"/>
+  <text class="nt" x="1436" y="822">session broker</text>
+  <text class="nd" x="1436" y="838">sessions/&lt;host&gt;.json — exploit+orch</text>
+  <text class="nd" x="1436" y="851">vend via session_get, never relogin</text>
+
+  <!-- ═══════════ EDGES ═══════════ -->
+  <!-- ① operator → CLI → Soundwave (or direct plan synthesis) -->
+  <path class="edge" d="M120,142 L120,196"/>
+  <text class="seq" x="130" y="175">①</text><text class="elab" x="142" y="175">engage</text>
+  <path class="edge" d="M210,226 L245,226 L245,139 L281,139"/>
+  <text class="elab" x="216" y="150">start</text>
+  <path class="edgeD" d="M210,240 L255,240 L255,229 L281,229"/>
+  <text class="eD" x="216" y="262">engage writes plan/roe.json</text>
+  <text class="eD" x="216" y="274">directly — no interview</text>
+
+  <!-- plan chain -->
+  <path class="edge" d="M385,163 L385,196"/>
+  <text class="elab" x="393" y="185">8-doc bundle</text>
+  <path class="edge" d="M385,258 L385,291"/>
+  <path class="edge" d="M385,347 L385,381"/>
+
+  <!-- ② approval → Buggy -->
+  <path class="edge" d="M485,414 L530,414 L530,155 L596,155"/>
+  <text class="seq" x="538" y="300">②</text>
+  <text class="elab" x="538" y="314">signed + approved</text>
+
+  <!-- benchmark → Buggy -->
+  <path class="edgeD" d="M210,460 L550,460 L550,172 L596,172"/>
+  <text class="eD" x="300" y="452">XBOW challenge</text>
+
+  <!-- Buggy → RoE (dispatch) -->
+  <path class="edgeR" d="M820,143 L926,141"/>
+  <text class="eR" x="838" y="132">task() dispatch</text>
+
+  <!-- enforce chain -->
+  <path class="edgeR" d="M1030,167 L1030,201"/>
+  <path class="edgeR" d="M1030,257 L1030,291"/>
+  <path class="edgeR" d="M1030,351 L1030,391"/>
+  <text class="eR" x="1038" y="330">allowed → logged</text>
+
+  <!-- RoE denied → audit -->
+  <path class="edgeR" d="M946,167 L915,167 L915,428 L926,428"/>
+  <text class="eR" x="850" y="300">denied</text>
+
+  <!-- egress → agent fan-out -->
+  <path class="edge" d="M1130,320 L1180,320 L1180,124 L1226,124"/>
+  <path class="edge" d="M1130,325 L1185,325 L1185,196 L1226,196"/>
+  <path class="edge" d="M1130,330 L1190,330 L1190,266 L1226,266"/>
+  <path class="edge" d="M1130,333 L1195,333 L1195,336 L1226,336"/>
+  <path class="edge" d="M1130,328 L1180,328 L1180,410 L1226,410"/>
+
+  <!-- agent stubs → trunk → target -->
+  <path class="stub" d="M1470,196 L1490,196"/>
+  <path class="stub" d="M1470,266 L1490,266"/>
+  <path class="stub" d="M1470,336 L1490,336"/>
+  <path class="stub" d="M1470,410 L1490,410"/>
+  <path class="edge" d="M1490,196 L1490,498 L1474,498"/>
+  <text class="elab" x="1500" y="350">bash + Caido HTTP</text>
+  <text class="elab" x="1500" y="363">(egress-bounded)</text>
+
+  <!-- ④ target → shield → exploit -->
+  <path class="edgeR" d="M1230,498 L1170,498 L1170,530 L1134,530"/>
+  <path class="edgeR" d="M1130,522 L1172,522 L1172,215 L1226,215"/>
+  <text class="seq" x="1178" y="570">④</text>
+  <text class="eR" x="1150" y="584">quarantined output → back to agent</text>
+
+  <!-- ③ recon → Neo4j (right margin) -->
+  <path class="edgeK" d="M1470,124 L1650,124 L1650,890 L720,890 L720,866"/>
+  <text class="seq" x="1658" y="520">③</text>
+  <text class="eK" x="1658" y="534">host / service map</text>
+
+  <!-- ⑤ exploit → workspace (right margin) -->
+  <path class="edgeG" d="M1470,200 L1585,200 L1585,695 L1050,695 L1050,701"/>
+  <text class="seq" x="1593" y="440">⑤</text>
+  <text class="eG" x="1593" y="454">FIND-*.md + PoC</text>
+
+  <!-- workspace → proof gate -->
+  <path class="edgeG" d="M970,767 L970,796"/>
+
+  <!-- proof gate PASS → Neo4j -->
+  <path class="edgeG" d="M890,831 L804,831"/>
+  <text class="eG" x="810" y="822">PASS · replay + dedup</text>
+
+  <!-- proof gate FAIL → Buggy re-plan -->
+  <path class="edgeR" d="M970,800 L875,800 L875,380 L855,380 L855,180 L750,180 L750,178"/>
+  <text class="eR" x="700" y="630">FAIL / UNVERIFIABLE → re-plan</text>
+
+  <!-- audit → workspace -->
+  <path class="edgeK" d="M930,428 L910,428 L910,700 L905,700 L905,701"/>
+
+  <!-- SARIF → queue → exploit (left channel + top lane) -->
+  <path class="edgeD" d="M560,736 L540,736 L540,196 L1226,196"/>
+  <text class="eD" x="548" y="190">queue item + finding_template (provenance)</text>
+
+  <!-- Neo4j → kg_query / blue_cell (left channel up) -->
+  <path class="edgeK" d="M580,800 L580,340 L596,340"/>
+  <path class="edgeK" d="M580,800 L580,143 L596,143"/>
+  <text class="seq" x="566" y="500">⑥</text>
+  <text class="eK" x="560" y="514">kg_query — paths+learnings · blue_cell detections</text>
+
+  <!-- Buggy → kg_recorder (right channel) -->
+  <path class="edgeD" d="M820,160 L870,160 L870,690 L1250,690 L1250,701"/>
+  <text class="eD" x="880" y="200">flag ✓ → record</text>
+
+  <!-- Buggy -.-> Devin (channel, out of band) -->
+  <path class="edgeD" d="M820,168 L880,168 L880,885 L1250,885 L1250,866"/>
+  <text class="eD" x="886" y="560">devin_delegate — opt-in only</text>
+
+  <!-- middleware → LiteLLM → providers -->
+  <path class="edgeD" d="M710,510 L710,695 L400,695 L400,701"/>
+  <text class="eD" x="560" y="688">LLM calls (per-role fallback)</text>
+  <path class="edgeD" d="M395,767 L395,796"/>
+
+  <!-- middleware → report -->
+  <path class="edgeD" d="M710,510 L710,685 L1530,685 L1530,701"/>
+  <text class="eD" x="1120" y="678">findings → report</text>
+
+  <!-- kg_recorder → Neo4j -->
+  <path class="edgeD" d="M1250,767 L1250,788 L780,788 L780,796"/>
+
+  <!-- report → operator (bottom sweep) -->
+  <path class="edge" d="M1530,767 L1530,950 L15,950 L15,116 L26,116"/>
+  <text class="elab" x="700" y="942">report + re-verification → operator</text>
+</svg>
+</body>
+</html>

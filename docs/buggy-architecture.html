@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Buggy — High-Level Architecture</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --edge: #30363d;
+    --txt: #e6edf3; --dim: #8b949e;
+    --entry: #58a6ff;  --orch: #d2a8ff; --agent: #56d4dd;
+    --tool: #7ee787;   --model: #ffa657; --kg: #f778ba;
+    --guard: #ff7b72;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 30px 36px 44px;
+    background: var(--bg); color: var(--txt);
+    font-family: -apple-system, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 13px; line-height: 1.45;
+  }
+  h1 { font-size: 20px; font-weight: 700; margin: 0 0 4px; letter-spacing: .5px; }
+  .sub { color: var(--dim); margin-bottom: 26px; }
+  .layer {
+    border: 1px solid var(--edge); border-radius: 10px;
+    background: var(--panel); padding: 16px 16px 14px; margin: 0 auto;
+    max-width: 1240px; position: relative;
+  }
+  .layer + .arrow { height: 26px; }
+  .arrow {
+    display: flex; align-items: center; justify-content: center;
+    color: var(--dim); font-size: 11px; gap: 8px; max-width: 1240px; margin: 0 auto;
+  }
+  .arrow .ln { flex: 1; height: 1px; background: var(--edge); }
+  .ltag {
+    position: absolute; top: -9px; left: 14px;
+    background: var(--bg); padding: 0 8px;
+    font-size: 10px; letter-spacing: 1.5px; text-transform: uppercase;
+  }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .box {
+    flex: 1 1 0; min-width: 150px;
+    border: 1px solid var(--edge); border-radius: 8px;
+    padding: 8px 10px; background: #0d1117;
+  }
+  .box b { display: block; font-size: 12px; margin-bottom: 3px; }
+  .box span { color: var(--dim); font-size: 11px; display: block; }
+  .e-entry { border-color: var(--entry); } .e-entry b, .t-entry { color: var(--entry); }
+  .e-orch  { border-color: var(--orch);  } .e-orch b,  .t-orch  { color: var(--orch); }
+  .e-agent { border-color: var(--agent); } .e-agent b, .t-agent { color: var(--agent); }
+  .e-tool  { border-color: var(--tool);  } .e-tool b,  .t-tool  { color: var(--tool); }
+  .e-model { border-color: var(--model); } .e-model b, .t-model { color: var(--model); }
+  .e-kg    { border-color: var(--kg);    } .e-kg b,    .t-kg    { color: var(--kg); }
+  .e-guard { border-color: var(--guard); } .e-guard b, .t-guard { color: var(--guard); }
+  .pipe { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+  .pipe .stage {
+    border: 1px solid var(--edge); border-radius: 6px;
+    padding: 4px 9px; font-size: 11px; background: #0d1117; white-space: nowrap;
+  }
+  .pipe .stage::after { content: " ›"; color: var(--dim); }
+  .pipe .stage:last-child::after { content: ""; }
+  .pipe .stage.warn { border-color: var(--guard); color: var(--guard); }
+  .chip {
+    display: inline-block; border: 1px solid var(--edge); border-radius: 5px;
+    padding: 2px 7px; font-size: 10.5px; color: var(--agent);
+    background: #0d1117; margin: 2px 2px 0 0;
+  }
+  .two { display: flex; gap: 14px; max-width: 1240px; margin: 0 auto; }
+  .two .layer { flex: 1; }
+  .note { max-width: 1240px; margin: 8px auto 0; color: var(--dim); font-size: 11px; }
+  .legend { max-width: 1240px; margin: 20px auto 0; display: flex; gap: 18px; flex-wrap: wrap; }
+  .legend div { font-size: 11px; color: var(--dim); }
+  .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 5px; }
+</style>
+</head>
+<body>
+
+<h1>Buggy — High-Level Architecture</h1>
+<div class="sub">Buggy fork · authorized offensive-security harness · two modes: <b>benchmark</b> (XBOW/CTF) and <b>engagement</b> (RoE-gated verification) · every agent gets a <b>fresh context</b> per objective</div>
+
+<!-- ENTRY -->
+<div class="layer">
+  <span class="ltag t-entry">Entry</span>
+  <div class="row">
+    <div class="box e-entry"><b>buggy CLI</b><span>start · auth · engagements · telemetry · skills</span></div>
+    <div class="box e-entry"><b>benchmark/harness.py</b><span>XBOW runner — challenge containers, flag scoring, KG recording</span></div>
+    <div class="box e-entry"><b>MCP server</b><span>LangGraph threads, selected-workspace isolation</span></div>
+    <div class="box e-entry"><b>Soundwave planner</b><span>standalone graph — interviews operator, writes the 8-doc bundle (RoE, CONOPS, Deconfliction…)</span></div>
+  </div>
+</div>
+
+<div class="arrow"><div class="ln"></div>▼<div class="ln"></div></div>
+
+<!-- ORCHESTRATORS -->
+<div class="layer">
+  <span class="ltag t-orch">Orchestrators — LangGraph</span>
+  <div class="row" style="margin-bottom:10px">
+    <div class="box e-orch"><b>Buggy</b><span>red-team orchestrator — reads OPPLAN, dispatches specialists, holds <b>devin_delegate</b> (opt-in; runs OUTSIDE the envelope)</span></div>
+    <div class="box e-orch"><b>Vulnresearch</b><span>5-stage pipeline — state passes between stages <b>only through the KG</b></span></div>
+    <div class="box e-orch"><b>blue_cell</b><span>defense agent — Offensive Vaccine loop (detections from attack paths)</span></div>
+  </div>
+  <div class="pipe">
+    <span class="stage warn">engagement ctx</span>
+    <span class="stage warn">RoE guardrail</span>
+    <span class="stage warn">HITL approval*</span>
+    <span class="stage warn">untrusted output</span>
+    <span class="stage warn">injection shield</span>
+    <span class="stage">skills</span>
+    <span class="stage">filesystem</span>
+    <span class="stage">sub-agent dispatch</span>
+    <span class="stage">OPPLAN</span>
+    <span class="stage">event log</span>
+    <span class="stage">budget</span>
+    <span class="stage">model override</span>
+    <span class="stage">model fallback</span>
+    <span class="stage">summarize</span>
+    <span class="stage">prompt cache</span>
+    <span class="stage">tool-call patch</span>
+  </div>
+  <div class="note">Middleware = named slots per role (<span style="color:var(--dim)">SLOTS_PER_ROLE</span>). Red = safety-critical — plugin-replaceable only with BUGGY_ALLOW_SAFETY_OVERRIDES=1. *HITL is opt-in (BUGGY_HITL__ENABLED).</div>
+</div>
+
+<div class="arrow"><div class="ln"></div>▼ dispatch — recon first<div class="ln"></div></div>
+
+<!-- AGENTS -->
+<div class="layer">
+  <span class="ltag t-agent">Specialist Sub-Agents (bash-executing unless noted)</span>
+  <div class="row">
+    <div class="box e-agent"><b>Kill-chain core</b>
+      <span class="chip">recon</span><span class="chip">exploit</span><span class="chip">postexploit</span><span class="chip">analyst</span><span class="chip">reverser</span>
+    </div>
+    <div class="box e-agent"><b>Domain operators</b>
+      <span class="chip">ad_operator</span><span class="chip">cloud_hunter</span><span class="chip">contract_auditor</span><span class="chip">phisher</span><span class="chip">mobile_operator</span><span class="chip">wireless_operator</span><span class="chip">osint_operator</span><span class="chip">iot_operator</span><span class="chip">ics_operator</span><span class="chip">forensicator</span><span class="chip">supply_chain</span>
+    </div>
+    <div class="box e-agent"><b>Vulnresearch pipeline</b>
+      <span class="chip">scanner</span><span class="chip">detector</span><span class="chip">verifier</span><span class="chip">patcher</span><span class="chip">exploiter</span>
+    </div>
+  </div>
+  <div class="note">Fresh context per objective — findings persist to <span style="color:var(--dim)">workspace/</span> + KG, not agent memory. exploit holds RECONCILIATION_TOOLS (SARIF→queue→finding_template→proof gate); analyst holds the KG recorder.</div>
+</div>
+
+<div class="arrow"><div class="ln"></div>▼ tools<div class="ln"></div></div>
+
+<!-- TOOLS + GUARDRAILS -->
+<div class="two">
+  <div class="layer">
+    <span class="ltag t-tool">Tooling</span>
+    <div class="row">
+      <div class="box e-tool"><b>Caido proxy + proof gate</b><span>live-evidence verification — typed CaidoError(kind, exit_code) → PASS/FAIL/UNVERIFIABLE, fail-closed</span></div>
+      <div class="box e-tool"><b>Reconciliation</b><span>SARIF intake → tasks → queue items carry provenance-seeded finding_template</span></div>
+      <div class="box e-tool"><b>bash + filesystem</b><span>sandboxed exec (nftables egress allowlist; BUGGY_EGRESS_DISABLE opts out)</span></div>
+      <div class="box e-tool"><b>kg_query</b><span>prior findings / attack paths / learnings — errors surfaced in a dedicated field</span></div>
+    </div>
+  </div>
+  <div class="layer" style="border-color:var(--guard)">
+    <span class="ltag t-guard">Enforcement Envelope</span>
+    <div class="row">
+      <div class="box e-guard"><b>plan/roe.json</b><span>scope, forbidden targets + commands, windows, egress — BUGGY_ROE_REQUIRE=1 → missing policy fails closed</span></div>
+      <div class="box e-guard"><b>HITL</b><span>operator approval for high-impact actions</span></div>
+      <div class="box e-guard"><b>Audit ledger</b><span>HMAC-chained RoE decisions → audit/roe-decisions.jsonl</span></div>
+    </div>
+  </div>
+</div>
+
+<div class="arrow"><div class="ln"></div>▼<div class="ln"></div></div>
+
+<!-- MODEL + KG -->
+<div class="two">
+  <div class="layer">
+    <span class="ltag t-model">Model Layer — LiteLLM gateway</span>
+    <div class="row">
+      <div class="box e-model"><b>Subscription probe</b><span>detects available creds (BUGGY_AUTH_*) — no single-provider assumption</span></div>
+      <div class="box e-model"><b>Fallback chain</b><span>per-role ordered model lists; the served model is logged for audit</span></div>
+      <div class="box e-model"><b>Refusal circuit</b><span>content_filter trips instantly; bare empty needs 2 consecutive → 900s blacklist</span></div>
+      <div class="box e-model"><b>Providers</b><span>Kimi · GLM · Claude/Opus · OpenAI · Grok (token file) · Fable · Gemini — Devin is a delegated agent, not a backend</span></div>
+    </div>
+  </div>
+  <div class="layer">
+    <span class="ltag t-kg">Knowledge — Neo4j</span>
+    <div class="row">
+      <div class="box e-kg"><b>Graph vocab</b><span>Finding · Host · Vulnerability · Technique · AttackPath(steps) — NodeKind/EdgeKind enums</span></div>
+      <div class="box e-kg"><b>kg_recorder / seeder</b><span>benchmark outcomes + harness learnings; idempotent re-seed via fixed timestamps</span></div>
+      <div class="box e-kg"><b>Future ingesters</b><span>pentest + bug-bounty report corpus share the same anchors</span></div>
+    </div>
+  </div>
+</div>
+
+<div class="arrow"><div class="ln"></div>▼<div class="ln"></div></div>
+
+<!-- BENCHMARK LOOP -->
+<div class="layer">
+  <span class="ltag t-entry">Benchmark Loop (BENCHMARK_MODE)</span>
+  <div class="pipe">
+    <span class="stage">XBOW container up</span>
+    <span class="stage">challenge → orchestrator</span>
+    <span class="stage">agent solve</span>
+    <span class="stage">flag verify</span>
+    <span class="stage">asyncio.to_thread → kg_recorder</span>
+    <span class="stage">learnings → Neo4j</span>
+  </div>
+  <div class="note">Parallel challenges serialize KG writes on a lock; blocking HTTP/Neo4j runs off the event loop.</div>
+</div>
+
+<div class="legend">
+  <div><i style="background:var(--entry)"></i>entry / benchmark</div>
+  <div><i style="background:var(--orch)"></i>orchestrators</div>
+  <div><i style="background:var(--agent)"></i>sub-agents</div>
+  <div><i style="background:var(--tool)"></i>tools</div>
+  <div><i style="background:var(--guard)"></i>enforcement</div>
+  <div><i style="background:var(--model)"></i>models</div>
+  <div><i style="background:var(--kg)"></i>knowledge graph</div>
+</div>
+
+</body>
+</html>

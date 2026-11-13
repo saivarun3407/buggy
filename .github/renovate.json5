@@ -1,0 +1,115 @@
+{
+  // Renovate config for the Buggy monorepo.
+  //
+  // Goals:
+  //   * Batch low-risk updates (minor / patch) so dependency PRs stay
+  //     reviewable instead of one-per-package.
+  //   * Group by ecosystem so a single PR moves a coherent slice of the
+  //     dep graph (Python via uv / pep621, Node in clients/, Go modules,
+  //     Docker base images, GH Actions versions).
+  //   * Match the repo's Conventional Commits style: `chore(deps): ...`,
+  //     `chore(ci): ...` for GH Actions.
+  //   * Never auto-merge — every PR is reviewed manually to keep main's
+  //     supply-chain story tight (cosign, SBOM, scorecard etc. all run
+  //     per PR via the existing security workflow).
+  //
+  // ACTIVATION — this file does nothing on its own.
+  //
+  // Renovate runs as a GitHub App. This config was committed long before
+  // the app was installed, so for months it was inert: no PRs, no
+  // branches, no dependency dashboard, zero Renovate activity in the
+  // repo's history. That is how 83 open advisories (3 critical, 31 high,
+  // 57 runtime-scope) accumulated. The app was installed on the
+  // PurpleAILAB organization on 2026-07-27.
+  //
+  // The trap worth naming, because it is what hid this: OpenSSF Scorecard
+  // awards Dependency-Update-Tool 10/10 for the mere *presence* of this
+  // file. It cannot see whether the app is installed. A green score here
+  // is not evidence that anything runs — verify with actual Renovate PRs
+  // or the dependency dashboard issue, never with the score.
+  //
+  // Installation is a browser OAuth flow with no REST API, so it cannot be
+  // scripted or asserted in CI. If Renovate ever goes quiet, check the
+  // installation before debugging this file. No secrets required.
+
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+  extends: [
+    "config:recommended",
+    ":dependencyDashboard",
+    ":semanticCommits",
+    ":maintainLockFilesWeekly",
+    "group:allNonMajor",
+    "schedule:weekly",
+  ],
+  timezone: "UTC",
+  semanticCommitType: "chore",
+  semanticCommitScope: "deps",
+  // Advisories from osv.dev on top of GitHub's, plus Renovate's
+  // malicious-package detection. Default is false. GitHub's advisory feed
+  // alone misses ecosystems and lags OSV on some CVEs, which is not a
+  // trade-off an offensive-security tool should be making about its own
+  // dependency graph.
+  osvVulnerabilityAlerts: true,
+  // Pin Docker base images by digest, and keep the digests current.
+  // Default is false, which is why `python:3.13-slim`, `node:24-slim` and
+  // `ghcr.io/berriai/litellm:v1.88.1` are still floating tags — the single
+  // largest deduction in Scorecard's Pinned-Dependencies check for this
+  // repo. Pinning by hand would be worse than not pinning: a frozen digest
+  // nobody bumps stops receiving base-image CVE fixes. Renovate has to own
+  // both halves or neither.
+  pinDigests: true,
+  // Keep noise in check: at most 5 PRs/hour, 10 concurrent open.
+  prHourlyLimit: 5,
+  prConcurrentLimit: 10,
+  // External benchmark submodules — Renovate must not touch them.
+  ignorePaths: [
+    "benchmark/xbow-validation-benchmarks/**",
+    "benchmark/MHBench/**",
+  ],
+  packageRules: [
+    {
+      description: "GitHub Actions bumps → chore(ci) scope",
+      matchManagers: ["github-actions"],
+      groupName: "github-actions",
+      semanticCommitScope: "ci",
+    },
+    {
+      description: "Python deps (uv-managed via pep621)",
+      matchManagers: ["pep621"],
+      groupName: "python deps",
+    },
+    {
+      description: "Node / TypeScript deps under clients/",
+      matchManagers: ["npm"],
+      groupName: "node deps",
+    },
+    {
+      description: "Go module updates",
+      matchManagers: ["gomod"],
+      groupName: "go modules",
+    },
+    {
+      description: "Docker base images (Dockerfile + docker-compose)",
+      matchManagers: ["dockerfile", "docker-compose"],
+      groupName: "docker base images",
+    },
+    {
+      description: "Major version bumps stay one-PR-per-package and are labeled",
+      matchUpdateTypes: ["major"],
+      labels: ["dependencies", "major-update"],
+    },
+  ],
+  // Only `labels` is set here on purpose. Renovate merges this over its
+  // own defaults, which already do the right thing for security work:
+  // `schedule: []` (so the weekly schedule above does NOT delay a security
+  // fix), `prCreation: "immediate"`, `rangeStrategy: "update-lockfile"`,
+  // and a `[SECURITY]` commit suffix. Re-stating them here would only
+  // create a second place to keep in sync.
+  vulnerabilityAlerts: {
+    labels: ["security", "dependencies"],
+  },
+  lockFileMaintenance: {
+    enabled: true,
+    schedule: ["before 6am on monday"],
+  },
+}

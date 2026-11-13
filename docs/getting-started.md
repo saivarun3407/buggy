@@ -1,0 +1,106 @@
+# Getting Started
+
+## Prerequisites
+
+- [Docker](https://docs.docker.com/get-docker/) and Docker Compose v2
+- An LLM provider credential — one of:
+  - **Tier-mapped API keys** (works out of the box): Anthropic, OpenAI, Google Gemini, MiniMax, DeepSeek, xAI, Mistral, OpenRouter, Nvidia NIM
+  - **Local LLM**: Ollama (`OLLAMA_API_BASE` + `OLLAMA_MODEL`)
+  - **Subscription OAuth** (no per-token billing): Claude Max/Pro/Team, ChatGPT Pro/Plus/Team, Gemini Advanced, Microsoft Copilot Pro, xAI SuperGrok, Perplexity Pro
+  - **Other providers** (Groq, Cohere, Together, Fireworks, Perplexity API, Azure, AWS Bedrock, Replicate, custom OpenAI-compatible gateway): supported via `BUGGY_MODEL` / `BUGGY_LITELLM_MODELS` ad-hoc registration
+
+That's it. Everything else runs inside containers.
+
+---
+
+## Install
+
+```bash
+curl -fsSL https://buggy.red/install | bash
+```
+
+This installs the `buggy` CLI to your system.
+
+---
+
+## Configure
+
+```bash
+buggy onboard
+```
+
+The interactive setup wizard guides you through:
+
+1. **Authentication** — API key, subscription OAuth (Claude / ChatGPT / Gemini / Copilot / SuperGrok / Perplexity), or local Ollama
+2. **Provider** — choose one of the tier-mapped providers, configure OAuth, or point at a local Ollama
+3. **Credentials** — API key, OAuth token, or endpoint URL (depending on auth method)
+4. **Model Profile** — `eco` (balanced), `max` (performance), `test` (development)
+5. **LangSmith** — Optional tracing for LLM observability
+
+For detailed provider setup including OAuth configuration, see [Setup Guide](setup-guide.md).
+
+Configuration is saved to `~/.buggy/.env`. Run `buggy onboard --reset` to reconfigure.
+
+---
+
+## Launch
+
+**Terminal CLI** (default):
+```bash
+buggy
+```
+
+Starts the core management and sandbox services, then opens the interactive terminal UI. Specialist services such as the C2 server and web dashboard start on demand.
+
+**Web Dashboard** (browser, optional):
+
+From the terminal UI, run `/web` (or `/web up`) to start the dashboard. It is then reachable at `http://localhost:3000`.
+
+---
+
+## First Real Engagement
+
+1. Launch Buggy (`buggy`). To use the browser UI, run `/web` and open <http://localhost:3000>.
+2. The **Soundwave** agent interviews you to define the engagement:
+   - Target scope (IP range, URL, Git repo, file upload, or local path)
+   - Threat actor profile
+   - Rules of Engagement (authorized scope, timing, exclusions)
+3. Soundwave writes the eight-document engagement bundle (RoE, Threat Profile, CONOPS, Deconfliction, Contact, Data Handling, Abort, Cleanup)
+4. The orchestrator builds the OPPLAN from the bundle — you review and approve it
+5. The autonomous loop begins
+
+> **Important**: Only run Buggy against systems you own or have explicit written authorization to test. See the disclaimer in the main README.
+
+---
+
+## Stopping Services
+
+```bash
+buggy stop     # Stop all services, keep data
+make clean          # Stop + remove all volumes (resets everything)
+```
+
+---
+
+## Check Service Status
+
+```bash
+buggy status        # Show running services
+buggy logs          # Follow LangGraph logs (default)
+buggy logs litellm  # Follow a specific service's logs
+buggy kg-health     # Diagnose the Neo4j knowledge graph
+```
+
+---
+
+## Next Steps
+
+| Topic | Doc |
+|-------|-----|
+| All CLI commands and keyboard shortcuts | [CLI Reference](cli-reference.md) |
+| All `make` targets | [Makefile Reference](makefile-reference.md) |
+| Agent roles and middleware | [Agents](agents.md) |
+| Model profiles and fallback chain | [Models](models.md) |
+| Engagement workflow (RoE → Execution) | [Engagement Workflow](engagement-workflow.md) |
+| Web dashboard features | [Web Dashboard](web-dashboard.md) |
+| Contributing to Buggy | [Contributing](contributing.md) |

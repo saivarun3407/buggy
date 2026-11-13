@@ -1,0 +1,449 @@
+"""OPPLANMiddleware — domain-specific objective tracking for red team engagements.
+
+This middleware injects OPPLAN instructions and live objective status into the
+model prompt, registers OPPLAN tools from ``buggy.tools.opplan``, and
+enforces one OPPLAN tool call per model step.
+
+OPPLAN persistence uses the same configured backend as the engagement
+filesystem tools. In production that backend is HTTPSandbox, scoped through
+EngagementFilesystemBackend, so reads/writes target the sandbox's active
+engagement workspace rather than the LangGraph host filesystem.
+
+Tools:
+  add_objective      — add single objective
+  get_objective      — read single objective detail
+  list_objectives    — list all objectives with progress summary
+  update_objective   — update status, notes, owner, or dependencies
+  objective_expand   — add child objectives
+  objective_collapse — cancel descendant objectives
+  load_opplan      — hydrate state from backend file
+
+Design notes:
+  - Domain model is engagement objective tracking for kill-chain execution
+  - Enum-typed parameters (ObjectivePhase, OpsecLevel, C2Tier)
+  - Kill chain dependencies (blocked_by) with execution-time validation
+  - Dynamic OPPLAN status injection every LLM call (battle tracker)
+  - Parallel mutation prevention (sequential counter-based IDs)
+  - Backend-mediated OPPLAN persistence at /workspace/plan/opplan.json
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Annotated, Any, NotRequired, cast, override
+
+from deepagents.backends.protocol import BackendProtocol
+from langchain.agents import AgentState
+from langchain.agents.middleware import AgentMiddleware
+from langchain.agents.middleware.types import OmitFromInput
+from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
+
+from buggy.tools.opplan import OPPLAN_TOOL_NAMES, build_opplan_tools
+
+
+def _reduce_engagement_name(current: str | None, update: str | None) -> str | None:
+    """Merge concurrent launcher/tool writes to the stable engagement slug."""
+    return update if update is not None else current
+
+
+def _reduce_workspace_path(current: str | None, update: str | None) -> str | None:
+    """Merge concurrent writes to the active workspace path.
+
+    Without a reducer, LangGraph rejects parallel state updates to the
+    same key with INVALID_CONCURRENT_GRAPH_UPDATE. The launcher is the
+    single source of truth, so every concurrent writer agrees on the
+    same value — last-write-wins on non-None is sufficient and matches
+    ``_reduce_engagement_name`` semantics. Closes #153.
+    """
+    return update if update is not None else current
+
+
+# ── State Schema ──────────────────────────────────────────────────────
+
+
+class OPPLANState(AgentState):
+    """Extended agent state with OPPLAN objectives.
+
+    Merged automatically by create_agent() when OPPLANMiddleware
+    is in the middleware stack. All fields are excluded from input schema
+    (OmitFromInput) — only the middleware tools can write to them.
+    """
+
+    objectives: Annotated[NotRequired[list[dict]], OmitFromInput]
+    """List of OPPLAN objectives in dict form (serialized Objective models)."""
+
+    engagement_name: NotRequired[Annotated[str, OmitFromInput, _reduce_engagement_name]]
+    """Current engagement name for context."""
+
+    threat_profile: Annotated[NotRequired[str], OmitFromInput]
+    """Threat actor profile for context injection."""
+
+    objective_counter: Annotated[NotRequired[int], OmitFromInput]
+    """Auto-increment counter for objective IDs."""
+
+    workspace_path: Annotated[NotRequired[str], OmitFromInput, _reduce_workspace_path]
+    """Engagement workspace root path — set by launcher config/load_opplan."""
+
+
+# ── System Prompt ─────────────────────────────────────────────────────
+
+OPPLAN_SYSTEM_PROMPT = """\
+## OPPLAN — Operational Plan Tracking
+
+You have OPPLAN tools to manage red team engagement objectives.
+These are always available — no mode switching needed.
+
+### Persistence model
+
+The launcher binds the engagement workspace at `/workspace`. Every mutation
+through these tools (`add_objective`, `update_objective`, `objective_expand`,
+`objective_collapse`) is **automatically persisted through the configured
+filesystem/sandbox backend to `/workspace/plan/opplan.json`** — there is no
+separate save step and no direct host-filesystem write. The persisted file is
+a stable, sorted, human-readable JSON document with a `schema_version`, a
+`saved_at` timestamp, and a `summary` block alongside the objectives list.
+
+### Objective CRUD Tools
+
+- **`add_objective`** — Add a single objective (auto-ID: OBJ-001, OBJ-002, ...).
+  Each objective MUST be completable in ONE sub-agent context window.
+  Set `engagement_name` and `threat_profile` on the first call to initialize context.
+
+- **`get_objective`** — Read a single objective's full details.
+  ALWAYS call this before `update_objective` (read-before-write, staleness prevention).
+
+- **`list_objectives`** — List all objectives with progress summary.
+  Use when: selecting the next objective, reviewing progress, situational awareness.
+
+- **`update_objective`** — Update status, notes, or owner.
+  ALWAYS call `get_objective` first.
+
+- **`objective_expand`** — Break a parent objective into N child sub-tasks.
+  Use when an objective is broad or when discovered work reveals sub-tasks —
+  keep each leaf small enough to complete in one sub-agent iteration.
+  This is the Pentesting Task Tree (PTT) pattern. Parents cannot move to
+  COMPLETED until every child is COMPLETED or CANCELLED.
+
+- **`objective_collapse`** — Cancel every descendant of a parent objective.
+  Use when abandoning a hierarchical task so the parent can then be moved
+  to COMPLETED or CANCELLED itself.
+
+- **`load_opplan`** — Bind the active workspace and hydrate state from an
+  existing `plan/opplan.json`. Call before filesystem bootstrap. A missing file
+  still binds the workspace so a new engagement can create its planning files.
+
+### Concurrency rule
+
+OPPLAN tools must be called **strictly one at a time** — never two OPPLAN
+tools in the same model step. The middleware will reject parallel
+OPPLAN calls with an error so each call observes the previous result
+before issuing the next. This applies to read tools (`get_objective`,
+`list_objectives`) as well as mutating tools.
+
+### Workflow
+```
+add_objective(×N, engagement_name=...) → Ralph Loop
+          ↓
+objective_expand(parent_id, children=[...])   # split broad work on demand
+```
+
+### Status Transitions
+```
+pending → in-progress → completed    (evidence documented)
+                       → blocked      (failure reason documented)
+                       → cancelled    (abandon cleanly)
+blocked → in-progress                 (retry with different approach)
+        → completed                   (abandon with explanation)
+        → cancelled                   (drop from plan)
+```
+
+### Rules — NEVER Violate
+- NEVER execute objectives without user-approved OPPLAN
+- NEVER call `update_objective` without calling `get_objective` first
+- NEVER call OPPLAN tools in parallel (one tool per model step)
+- ALWAYS include evidence when marking COMPLETED
+- ALWAYS include failure reason and attempts when marking BLOCKED — and note
+  that BLOCKED is mechanically gated: the notes must cite evidence (an exit
+  artifact such as exploit/EXIT_REPORT.md or recon/SUMMARY.md, a differential
+  matrix for reachability/WAF claims, a liveness verdict, or an operator/scope
+  adjudication). Evidence-free blocks are rejected by the tool.
+- ALWAYS set owner to the sub-agent name before delegating (recon/exploit/postexploit)
+- ALWAYS respect blocked_by dependencies and kill chain phase order
+"""
+
+
+# ── Formatting Helpers ────────────────────────────────────────────────
+
+
+#: Maximum number of objective rows ``_format_opplan_status`` will
+#: render into the system prompt. Past this cap, completed/cancelled
+#: objectives collapse into a single summary line and only the
+#: actionable (pending / in-progress / blocked) ones retain a full
+#: table row. Overridable via ``BUGGY_OPPLAN_MAX_ROWS``.
+try:
+    _OPPLAN_MAX_ROWS = int(os.environ.get("BUGGY_OPPLAN_MAX_ROWS", "40"))
+except ValueError:
+    _OPPLAN_MAX_ROWS = 40
+
+_STATUS_MARKERS = {
+    "completed": "COMPLETED",
+    "blocked": "BLOCKED",
+    "cancelled": "CANCELLED",
+    "in-progress": ">>IN-PROGRESS<<",
+    "pending": "pending",
+}
+
+_TERMINAL_STATUSES = {"completed", "cancelled"}
+
+
+def _format_opplan_status(
+    objectives: list[dict],
+    engagement_name: str,
+    threat_profile: str,
+) -> str:
+    """Format OPPLAN for system prompt injection (concise battle tracker).
+
+    Injected every LLM call via wrap_model_call, providing dynamic
+    situational awareness — the red team equivalent of a battle
+    tracker. To bound token cost on long / deeply-expanded plans we
+    trim terminal objectives (completed / cancelled) from the main
+    table once the total row count exceeds ``_OPPLAN_MAX_ROWS``.
+    """
+    total = len(objectives)
+    completed = 0
+    blocked = 0
+    in_progress = 0
+    pending = 0
+    cancelled = 0
+    for o in objectives:
+        status = o.get("status") or ""
+        if status == "completed":
+            completed += 1
+        elif status == "blocked":
+            blocked += 1
+        elif status == "in-progress":
+            in_progress += 1
+        elif status == "pending":
+            pending += 1
+        elif status == "cancelled":
+            cancelled += 1
+
+    actionable = [o for o in objectives if o.get("status") in ("pending", "in-progress")]
+    actionable.sort(key=lambda o: o.get("priority", 999))
+    next_obj = actionable[0] if actionable else None
+
+    progress_line = (
+        f"Progress: {completed}/{total} completed, {blocked} blocked, "
+        f"{in_progress} in-progress, {pending} pending"
+    )
+    if cancelled:
+        progress_line += f", {cancelled} cancelled"
+
+    lines = [
+        "<OPPLAN_STATUS>",
+        f"Engagement: {engagement_name}",
+        f"Threat Profile: {threat_profile}",
+        progress_line,
+        "",
+        "| ID | Phase | Title | Status | Priority | Owner |",
+        "|---|---|---|---|---|---|",
+    ]
+
+    # Render actionable objectives in full, then terminal ones only
+    # until the row budget is exhausted.
+    sorted_objectives = sorted(objectives, key=lambda x: x.get("priority", 999))
+    actionable_rows: list[dict[str, Any]] = []
+    terminal_rows: list[dict[str, Any]] = []
+    for o in sorted_objectives:
+        if o.get("status") in _TERMINAL_STATUSES:
+            terminal_rows.append(o)
+        else:
+            actionable_rows.append(o)
+
+    rendered = 0
+    for o in actionable_rows:
+        status_marker = _STATUS_MARKERS.get(o.get("status", ""), o.get("status", ""))
+        lines.append(
+            f"| {o.get('id', '?')} | {o.get('phase', '?')} | "
+            f"{o.get('title', '?')} | {status_marker} | "
+            f"{o.get('priority', '?')} | {o.get('owner') or '-'} |"
+        )
+        rendered += 1
+
+    remaining_budget = max(0, _OPPLAN_MAX_ROWS - rendered)
+    shown_terminal = terminal_rows[:remaining_budget]
+    for o in shown_terminal:
+        status_marker = _STATUS_MARKERS.get(o.get("status", ""), o.get("status", ""))
+        lines.append(
+            f"| {o.get('id', '?')} | {o.get('phase', '?')} | "
+            f"{o.get('title', '?')} | {status_marker} | "
+            f"{o.get('priority', '?')} | {o.get('owner') or '-'} |"
+        )
+    hidden = len(terminal_rows) - len(shown_terminal)
+    if hidden > 0:
+        lines.append(f"| … | … | _{hidden} more terminal objectives_ | … | … | … |")
+
+    if next_obj:
+        lines.extend(
+            [
+                "",
+                f"**Next**: {next_obj.get('id')} — {next_obj.get('title')}",
+                f"  Phase: {next_obj.get('phase')} | "
+                f"MITRE: {', '.join(next_obj.get('mitre') or []) or 'n/a'} | "
+                f"OPSEC: {next_obj.get('opsec', 'standard')} | "
+                f"C2: {next_obj.get('c2_tier', 'interactive')}",
+            ]
+        )
+        criteria = next_obj.get("acceptance_criteria", [])
+        if criteria:
+            lines.append("  Acceptance Criteria:")
+            for c in criteria:
+                lines.append(f"    - [ ] {c}")
+    else:
+        lines.append("")
+        # Guard against the empty-objectives case: ``all([])`` is vacuously
+        # True, which previously rendered "ALL OBJECTIVES COMPLETE" for an
+        # engagement that had zero objectives ever defined. Treat zero as
+        # "no plan yet" rather than "all done".
+        all_done = bool(objectives) and all(o.get("status") == "completed" for o in objectives)
+        if all_done:
+            lines.append("**ALL OBJECTIVES COMPLETE** — Generate final engagement report.")
+        elif not objectives:
+            lines.append("**No objectives defined** — Add objectives to begin the engagement.")
+        else:
+            lines.append("**No actionable objectives** — Review blocked items for retry.")
+
+    lines.append("</OPPLAN_STATUS>")
+    return "\n".join(lines)
+
+
+# ── Middleware Class ──────────────────────────────────────────────────
+
+
+class OPPLANMiddleware(AgentMiddleware):
+    """Domain-specific OPPLAN tracking for red team engagements.
+
+    Tools execute CRUD logic directly via InjectedState, appearing as proper
+    `tool` type runs in LangSmith.
+
+    - __init__: creates OPPLAN CRUD tools
+    - wrap_model_call: injects dynamic OPPLAN progress into system message
+    - after_model: validates no parallel state-mutating calls
+
+    State schema (OPPLANState) is auto-merged by create_agent().
+    """
+
+    state_schema = OPPLANState
+
+    def __init__(self, backend: BackendProtocol | None = None) -> None:
+        super().__init__()
+        self._backend = backend
+        self.tools = build_opplan_tools(backend)
+
+    # ── wrap_model_call: inject OPPLAN context ────────────────────────
+
+    @override
+    def wrap_model_call(self, request, handler):
+        """Inject OPPLAN system prompt + dynamic progress into system message."""
+        return handler(self._inject_opplan_context(request))
+
+    @override
+    async def awrap_model_call(self, request, handler):
+        """Async variant — identical logic."""
+        return await handler(self._inject_opplan_context(request))
+
+    def _inject_opplan_context(self, request):
+        """Build request with OPPLAN context injected into system message.
+
+        Splits the injection into TWO content blocks so the Anthropic prompt
+        cache can reuse the static prefix across turns:
+
+          - **Static block** — `OPPLAN_SYSTEM_PROMPT` (identical every turn)
+            tagged with `cache_control: {"type": "ephemeral"}`. This anchors a
+            cache breakpoint after every static system content (base prompt +
+            engagement + skills + subagents + this static OPPLAN block).
+          - **Dynamic block** — formatted objective status table (changes when
+            objectives change status). No cache marker — recomputed every turn.
+
+        AnthropicPromptCachingMiddleware additionally marks the LAST block
+        (this dynamic one) per its own policy; Anthropic supports up to 4
+        cache_control breakpoints so the two coexist without conflict. The
+        static prefix cache hit avoids re-billing ~10K+ tokens of engagement
+        context + skills catalog + subagent descriptions on every turn.
+        """
+        objectives = request.state.get("objectives", [])
+        engagement = request.state.get("engagement_name", "")
+        threat = request.state.get("threat_profile", "")
+
+        static_block: dict[str, Any] = {
+            "type": "text",
+            "text": f"\n\n{OPPLAN_SYSTEM_PROMPT}",
+            "cache_control": {"type": "ephemeral"},
+        }
+        injected_blocks: list[dict[str, Any]] = [static_block]
+
+        if objectives:
+            dynamic_text = _format_opplan_status(objectives, engagement, threat)
+            injected_blocks.append({"type": "text", "text": f"\n\n{dynamic_text}"})
+
+        if request.system_message is not None:
+            new_content = [
+                *request.system_message.content_blocks,
+                *injected_blocks,
+            ]
+        else:
+            new_content = injected_blocks
+
+        new_system = SystemMessage(content=cast("list[str | dict[str, str]]", new_content))
+        return request.override(system_message=new_system)
+
+    # ── after_model: validate constraints ─────────────────────────────
+
+    @override
+    def after_model(self, state, runtime):
+        """Reject parallel OPPLAN tool calls in the same model step.
+
+        Mutating tools (add/update/expand/collapse/load_opplan) race on
+        ``state.objectives`` because the field has no merge reducer; reads
+        (get/list) gain nothing from parallelism but mixing them with writes
+        muddies the contract. Apply one rule: at most one OPPLAN tool per
+        LLM step. Each call gets a separate ToolMessage error so the LLM
+        can re-issue them sequentially.
+        """
+        messages = state.get("messages", [])
+        if not messages:
+            return None
+
+        last_ai = next(
+            (m for m in reversed(messages) if isinstance(m, AIMessage)),
+            None,
+        )
+        if not last_ai or not last_ai.tool_calls:
+            return None
+
+        opplan_calls = [tc for tc in last_ai.tool_calls if tc["name"] in OPPLAN_TOOL_NAMES]
+        if len(opplan_calls) > 1:
+            # Allow the first OPPLAN call to execute normally; reject
+            # only the 2nd+ parallel calls so the model re-issues them
+            # sequentially after observing the first result.
+            names = ", ".join(sorted({tc["name"] for tc in opplan_calls[1:]}))
+            return {
+                "messages": [
+                    ToolMessage(
+                        content=(
+                            f"Error: parallel OPPLAN calls ({names}) rejected — "
+                            "re-issue one at a time after the first completes."
+                        ),
+                        tool_call_id=tc["id"],
+                        status="error",
+                    )
+                    for tc in opplan_calls[1:]
+                ]
+            }
+
+        return None
+
+    @override
+    async def aafter_model(self, state, runtime):
+        """Async variant delegates to sync."""
+        return self.after_model(state, runtime)

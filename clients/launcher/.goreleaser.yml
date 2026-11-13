@@ -1,0 +1,57 @@
+version: 2
+
+project_name: buggy
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: buggy
+    dir: .
+    main: ./main.go
+    binary: buggy
+    env:
+      - CGO_ENABLED=0
+    # One artifact per OS/arch: Linux, macOS and Windows on amd64 + arm64.
+    # arm64 covers Apple Silicon and 64-bit Raspberry Pi OS (Pi 3/4/5).
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/saivarun3407/buggy/clients/launcher/cmd.version={{.Version}}
+
+archives:
+  - id: binaries
+    format: binary
+    name_template: "buggy-{{ .Os }}-{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+
+release:
+  github:
+    owner: PurpleAILAB
+    name: Buggy
+  # Publish as draft so the GitHub `releases/latest` endpoint (used by the
+  # launcher's update notice and explicit `buggy update`) does NOT see
+  # this version until every Docker image is verified on GHCR. The publish-release job in
+  # .github/workflows/release.yml flips draft → published once all images
+  # exist, closing the release-atomicity gap that previously let the
+  # launcher pull a tag whose images were still mid-push.
+  draft: true
+  prerelease: auto
+  name_template: "v{{.Version}}"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
