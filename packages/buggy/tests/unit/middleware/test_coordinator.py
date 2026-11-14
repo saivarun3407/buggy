@@ -145,6 +145,7 @@ def test_two_concurrent_registrations_both_survive_merge() -> None:
     join; the reducer keeps both rather than dropping one."""
     orchestrator = CoordinatorMiddleware(role="buggy").before_agent({}, runtime=None)
     specialist = CoordinatorMiddleware(role="recon").before_agent({}, runtime=None)
+    assert orchestrator is not None and specialist is not None
     merged = _merge_agent_graph(orchestrator["agent_graph"], specialist["agent_graph"])
     assert set(merged) == {"buggy-1", "recon-1"}
 
