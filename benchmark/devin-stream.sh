@@ -11,7 +11,7 @@
 set -u
 
 BENCH_LOG="${BENCH_LOG:-/tmp/devin-full-run.log}"
-CONTAINER="${DEVIN_CONTAINER:-buggy-langgraph}"
+CONTAINER="${DEVIN_CONTAINER:-buggy-solver}"
 
 echo "════════ BENCHMARK RUN PROGRESS ════════"
 if [ -f "$BENCH_LOG" ]; then

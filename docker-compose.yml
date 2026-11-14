@@ -803,6 +803,27 @@ services:
     profiles:
       - ad
 
+
+  # ── Web-blind devin solver ────────────────────────────────────────────
+  # Runs benchmark/engagement devin sessions with external egress blocked
+  # (see containers/solver.Dockerfile): challenge targets + the devin
+  # backend are reachable, the general internet is not — so a solve can
+  # only come from exploiting the target, never from looking up published
+  # solutions. Requires NET_ADMIN to install the iptables allowlist.
+  solver:
+    image: buggy-solver:${BUGGY_VERSION:-stable}
+    build:
+      context: .
+      dockerfile: containers/solver.Dockerfile
+    container_name: buggy${BUGGY_STACK_NAME:+-${BUGGY_STACK_NAME}}-solver
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ${DEVIN_BIN_VOLUME:-/dev/null}:/usr/local/bin/devin:ro
+      - ${DEVIN_CREDENTIALS_VOLUME:-/dev/null}:/root/.local/share/devin/credentials.toml:ro
+    depends_on:
+      - langgraph
+
 volumes:
   postgres_data:
   sliver_data:

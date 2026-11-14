@@ -24,6 +24,13 @@ from benchmark.state import BenchmarkRunState, BenchmarkStepResult
 log = logging.getLogger(__name__)
 
 
+# Container hosting devin solver sessions. The dedicated web-blind solver
+# (containers/solver.Dockerfile) blocks external egress so a session can only
+# reach its challenge targets and the devin backend — solves must come from
+# exploiting the target, never from looking up published solutions online.
+DEVIN_SOLVER_CONTAINER = "buggy-solver"
+
+
 def _run_docker(
     args: list[str], timeout: float | None = None
 ) -> subprocess.CompletedProcess[bytes]:
@@ -771,7 +778,7 @@ class Harness:
         cmd = [
             "docker",
             "exec",
-            "buggy-langgraph",
+            DEVIN_SOLVER_CONTAINER,
             "/usr/local/bin/devin",
             "-p",
             "--respect-workspace-trust",
@@ -805,7 +812,7 @@ class Harness:
             # it cannot bleed into the next challenge's window.
             proc.kill()
             await proc.wait()
-            _run_docker(["docker", "exec", "buggy-langgraph", "pkill", "-f", "devin -p"])
+            _run_docker(["docker", "exec", DEVIN_SOLVER_CONTAINER, "pkill", "-f", "devin -p"])
             raise
         if proc.returncode != 0:
             tail = stderr.decode(errors="replace")[-500:] if stderr else ""

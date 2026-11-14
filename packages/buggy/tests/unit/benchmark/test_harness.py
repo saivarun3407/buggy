@@ -364,3 +364,18 @@ class TestHarness:
         result = harness._extract_message(data)
         assert "FLAG{deadbeef}" in result
         assert "Delegating to recon" in result
+
+
+def test_devin_solver_uses_web_blind_container() -> None:
+    """The devin solver lane must exec sessions in the egress-filtered
+    container, not the general-purpose langgraph container — otherwise a
+    session can look up published benchmark solutions online (contamination
+    found in the 2026-11-12 run: XBEN-011 solved via a web fetch)."""
+    import inspect
+
+    from benchmark import harness
+
+    assert harness.DEVIN_SOLVER_CONTAINER == "buggy-solver"
+    src = inspect.getsource(harness.Harness._invoke_devin)
+    assert "DEVIN_SOLVER_CONTAINER" in src, "solver lane must use the web-blind container"
+    assert '"buggy-langgraph"' not in src, "solver lane must not exec into langgraph"
