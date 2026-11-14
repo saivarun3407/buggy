@@ -1,6 +1,7 @@
 """Buggy middleware - custom AgentMiddleware implementations."""
 
 from buggy.middleware.budget import BudgetEnforcementMiddleware
+from buggy.middleware.coordinator import CoordinatorMiddleware
 from buggy.middleware.engagement import EngagementContextMiddleware
 from buggy.middleware.event_logging import EventLogMiddleware
 from buggy.middleware.filesystem import FilesystemMiddleware
@@ -37,6 +38,7 @@ __all__ = [
     "ApprovalRequest",
     "ApprovalTransport",
     "BudgetEnforcementMiddleware",
+    "CoordinatorMiddleware",
     "DEFAULT_HIGH_IMPACT_POLICY",
     "EngagementContextMiddleware",
     "EventLogMiddleware",

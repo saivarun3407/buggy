@@ -46,6 +46,11 @@ class MiddlewareSlot(StrEnum):
     SUBAGENT = "subagent"
     OPPLAN = "opplan"
     KG = "kg"
+    # Agent-coordination registry + read-only view_agent_graph tool. Sits
+    # after KG among the context-injection slots: its wrap_model_call adds a
+    # cache-eligible static prompt block, nesting like OPPLAN/KG, and it does
+    # not wrap tool calls, so its position relative to them is immaterial.
+    COORDINATOR = "coordinator"
     EVENT_LOG = "event-log"
     SANDBOX_NOTIFICATION = "sandbox-notification"
     # ADR-0006: the orchestrator-only middleware that turns opscontrol
@@ -200,6 +205,7 @@ SLOTS_PER_ROLE: dict[str, frozenset[MiddlewareSlot]] = {
     | {
         MiddlewareSlot.ENGAGEMENT_CONTEXT,
         MiddlewareSlot.SUBAGENT,
+        MiddlewareSlot.COORDINATOR,
         MiddlewareSlot.OPPLAN,
         MiddlewareSlot.MODEL_OVERRIDE,
         MiddlewareSlot.HITL_APPROVAL,
@@ -254,7 +260,8 @@ SLOTS_PER_ROLE: dict[str, frozenset[MiddlewareSlot]] = {
     "supply_chain_operator": _BASH_AGENT_SLOTS,
     # ── Plugin orchestrator (no EngagementContext per the existing
     # vulnresearch factory — it consumes its parent's context) ──
-    "vulnresearch": _BASE_SLOTS | {MiddlewareSlot.SUBAGENT, MiddlewareSlot.OPPLAN},
+    "vulnresearch": _BASE_SLOTS
+    | {MiddlewareSlot.SUBAGENT, MiddlewareSlot.COORDINATOR, MiddlewareSlot.OPPLAN},
     # ── Plugin read-only specialist (no bash, no SandboxNotification) ──
     "detector": _BASE_SLOTS,
     # ── Plugin bash-executing specialists ──

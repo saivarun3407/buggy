@@ -39,6 +39,7 @@ from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
 
 from buggy.agents._benchmark_mode import benchmark_skill_sources
 from buggy.middleware import (
+    CoordinatorMiddleware,
     EngagementContextMiddleware,
     FilesystemMiddleware,
     KGMiddleware,
@@ -241,6 +242,10 @@ def _make_subagent(*, backend: Any, subagents: list | None = None, **_: Any):
 
 def _make_opplan(*, backend: Any, **_: Any):
     return OPPLANMiddleware(backend=backend)
+
+
+def _make_coordinator(*, role: str, **_: Any):
+    return CoordinatorMiddleware(role=role)
 
 
 def _make_kg(**_: Any):
@@ -460,6 +465,7 @@ DEFAULT_SLOT_FACTORIES: dict[MiddlewareSlot, SlotFactory] = {
     MiddlewareSlot.SUBAGENT: _make_subagent,
     MiddlewareSlot.OPPLAN: _make_opplan,
     MiddlewareSlot.KG: _make_kg,
+    MiddlewareSlot.COORDINATOR: _make_coordinator,
     MiddlewareSlot.EVENT_LOG: _make_event_log,
     MiddlewareSlot.SANDBOX_NOTIFICATION: _make_sandbox_notification,
     MiddlewareSlot.OPSCONTROL_NOTIFICATION: _make_opscontrol_notification,
